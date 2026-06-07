@@ -1,5 +1,5 @@
 flask
 line-bot-sdk==2.4.2
 yfinance
-pandas==2.2.2
+pandas==2.2.3
 gunicorn
