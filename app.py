@@ -12,8 +12,9 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 import os
 import re
-import traceback
 import math
+import time
+import traceback
 from io import StringIO
 
 import pandas as pd
@@ -23,21 +24,37 @@ import requests
 
 # ============================================================
 # HCX AI 股票分析師 LINE Bot
-# V3 華麗版：多元查詢 + 股票名稱 + 主力成本 + 進出場點位
+# V5 黑暗量子雷達強化版
+# 重點：
+# 1. 參考黑暗量子雷達：先抓 TWSE / TPEx 官方全市場資料，代號與名稱一起建立快取
+# 2. 股票名稱不再只靠 yfinance，避免 2330 2330、1717 1717
+# 3. 加入主力成本估算、支撐壓力、台股 Tick 合法價位
+# 4. 加入做多 / 做空價位說明
 # ============================================================
 
-APP_VERSION = "V4 華麗版｜台股Tick修正＋多空價位＋股票名稱＋主力成本"
+APP_VERSION = "V5 黑暗量子雷達強化版｜官方名稱快取＋主力成本＋Tick多空價位"
 
 app = Flask(__name__)
 
 configuration = Configuration(access_token=os.environ["LINE_CHANNEL_ACCESS_TOKEN"])
 handler = WebhookHandler(os.environ["LINE_CHANNEL_SECRET"])
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+}
 
-# ------------------------------------------------------------
-# 股票名稱備援表
-# 重點：1717 長興直接放在第一層，避免外部資料源失效時顯示 1717 1717
-# ------------------------------------------------------------
+TWSE_OPENAPI_DAY_ALL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+TPEX_OPENAPI_DAILY = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+
+# 官方名稱快取，避免每次查詢都重新抓全市場
+MARKET_META_CACHE = {
+    "ts": 0,
+    "data": {}
+}
+
+# 常用股票名稱備援表：官方資料源或外部網路臨時失敗時，仍可顯示名稱
 FALLBACK_STOCK_NAMES = {
     "1101": "台泥",
     "1102": "亞泥",
@@ -47,6 +64,7 @@ FALLBACK_STOCK_NAMES = {
     "1326": "台化",
     "1402": "遠東新",
     "1476": "儒鴻",
+    "1504": "東元",
     "1605": "華新",
     "1717": "長興",
     "2002": "中鋼",
@@ -55,19 +73,27 @@ FALLBACK_STOCK_NAMES = {
     "2303": "聯電",
     "2308": "台達電",
     "2317": "鴻海",
+    "2324": "仁寶",
     "2327": "國巨",
     "2330": "台積電",
+    "2344": "華邦電",
     "2345": "智邦",
+    "2353": "宏碁",
+    "2356": "英業達",
     "2357": "華碩",
+    "2371": "大同",
     "2379": "瑞昱",
     "2382": "廣達",
     "2408": "南亞科",
     "2409": "友達",
     "2412": "中華電",
+    "2449": "京元電子",
     "2454": "聯發科",
+    "2498": "宏達電",
     "2603": "長榮",
     "2609": "陽明",
     "2615": "萬海",
+    "2880": "華南金",
     "2881": "富邦金",
     "2882": "國泰金",
     "2884": "玉山金",
@@ -94,133 +120,182 @@ FALLBACK_STOCK_NAMES = {
 
 
 def clean_text(x):
-    return re.sub(r"\s+", " ", str(x).strip())
+    return re.sub(r"\s+", " ", str(x or "").strip())
 
 
-def get_stock_name_from_openapi(code):
-    """TWSE / TPEx OpenAPI 名稱查詢。"""
-    urls = [
-        "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
-        "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
-    ]
-
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=8)
-            if r.status_code != 200:
-                continue
-
-            data = r.json()
-            for item in data:
-                sid = clean_text(
-                    item.get("公司代號")
-                    or item.get("股票代號")
-                    or item.get("有價證券代號")
-                    or ""
-                )
-                name = clean_text(
-                    item.get("公司簡稱")
-                    or item.get("公司名稱")
-                    or item.get("股票名稱")
-                    or item.get("有價證券名稱")
-                    or ""
-                )
-
-                if sid == code and name and name.lower() != "nan":
-                    return name
-
-        except Exception:
-            continue
-
-    return None
-
-
-def get_stock_name_from_isin(code, mode):
-    """
-    TWSE ISIN 名稱查詢。
-    mode=2 上市，mode=4 上櫃。
-    """
+def clean_num(x):
+    if pd.isna(x):
+        return None
+    s = str(x).strip()
+    if s in ["", "--", "---", "-", "N/A", "NaN", "nan"]:
+        return None
+    s = s.replace(",", "").replace("％", "").replace("%", "")
+    s = s.replace("+", "").replace("X", "").replace("x", "")
+    s = re.sub(r"[^0-9.\-]", "", s)
     try:
-        url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
-        r.encoding = "big5"
-
-        tables = pd.read_html(StringIO(r.text))
-        if not tables:
-            return None
-
-        df = tables[0]
-        first_col = df.columns[0]
-
-        for value in df[first_col].astype(str):
-            value = clean_text(value)
-
-            if value.startswith(code):
-                name = value.replace(code, "", 1).strip()
-                name = re.split(r"\s+", name)[0].strip()
-
-                if name and name.lower() != "nan" and "有價證券" not in name:
-                    return name
-
+        return float(s)
     except Exception:
         return None
 
-    return None
 
-
-def get_stock_name_from_yfinance(code):
-    """yfinance 英文名稱備援。"""
-    symbols = [f"{code}.TW", f"{code}.TWO", code]
-
-    for symbol in symbols:
+def request_json(url, params=None, timeout=12, tries=2):
+    last_err = None
+    for _ in range(tries):
         try:
-            ticker = yf.Ticker(symbol)
-            info = ticker.get_info()
-            name = info.get("shortName") or info.get("longName")
-            if name:
-                return clean_text(name)
-        except Exception:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(0.25)
+    raise last_err
+
+
+def normalize_official_rows(data, market):
+    """
+    參考黑暗量子雷達邏輯：
+    將 TWSE / TPEx 不同欄位名稱統一成 代號、名稱、市場、收盤。
+    """
+    rows = []
+    if not isinstance(data, list):
+        return rows
+
+    for item in data:
+        if not isinstance(item, dict):
             continue
 
-    return None
+        code = clean_text(
+            item.get("Code")
+            or item.get("證券代號")
+            or item.get("股票代號")
+            or item.get("代號")
+            or item.get("SecuritiesCompanyCode")
+            or item.get("有價證券代號")
+            or item.get("公司代號")
+            or ""
+        ).replace("=", "").replace('"', "")
+
+        name = clean_text(
+            item.get("Name")
+            or item.get("證券名稱")
+            or item.get("股票名稱")
+            or item.get("名稱")
+            or item.get("CompanyName")
+            or item.get("有價證券名稱")
+            or item.get("公司簡稱")
+            or item.get("公司名稱")
+            or ""
+        )
+
+        close = clean_num(
+            item.get("ClosingPrice")
+            or item.get("收盤價")
+            or item.get("收盤")
+            or item.get("Close")
+            or item.get("LatestPrice")
+            or item.get("最新成交價")
+        )
+
+        volume = clean_num(
+            item.get("TradeVolume")
+            or item.get("成交股數")
+            or item.get("成交數量")
+            or item.get("成交量")
+            or item.get("Volume")
+        )
+
+        if re.fullmatch(r"\d{4}", code) and name and name.lower() != "nan":
+            rows.append({
+                "代號": code,
+                "名稱": name,
+                "市場": market,
+                "官方收盤": close,
+                "官方成交股數": volume,
+            })
+
+    return rows
 
 
-def get_stock_name(code):
+def fetch_market_meta(force=False):
     """
-    股票名稱查詢順序：
-    1. 內建備援表
-    2. TWSE/TPEx OpenAPI
-    3. TWSE ISIN 上市/上櫃
-    4. yfinance
-    5. 代號
+    抓官方全市場代號名稱，建立快取。
+    這是修正「股票名稱跑不出來」的核心。
     """
+    now = time.time()
+
+    # 快取 60 分鐘
+    if not force and MARKET_META_CACHE["data"] and now - MARKET_META_CACHE["ts"] < 3600:
+        return MARKET_META_CACHE["data"]
+
+    meta = {}
+
+    # TWSE 上市
+    try:
+        twse_data = request_json(TWSE_OPENAPI_DAY_ALL)
+        for row in normalize_official_rows(twse_data, "上市"):
+            meta[row["代號"]] = row
+    except Exception as e:
+        print("TWSE 官方名稱抓取失敗：", e, flush=True)
+
+    # TPEx 上櫃
+    try:
+        tpex_data = request_json(TPEX_OPENAPI_DAILY)
+        for row in normalize_official_rows(tpex_data, "上櫃"):
+            meta[row["代號"]] = row
+    except Exception as e:
+        print("TPEx 官方名稱抓取失敗：", e, flush=True)
+
+    # 內建備援也塞進 meta，避免官方暫時失效
+    for code, name in FALLBACK_STOCK_NAMES.items():
+        if code not in meta:
+            meta[code] = {
+                "代號": code,
+                "名稱": name,
+                "市場": "上市",
+                "官方收盤": None,
+                "官方成交股數": None,
+            }
+        else:
+            # 官方名稱空掉時用備援補
+            if not meta[code].get("名稱") or meta[code].get("名稱") == code:
+                meta[code]["名稱"] = name
+
+    MARKET_META_CACHE["ts"] = now
+    MARKET_META_CACHE["data"] = meta
+    return meta
+
+
+def get_stock_meta(code):
     code = str(code).strip()
+    meta = fetch_market_meta().get(code)
 
-    # 這段是保險，避免 1717 再次顯示成 1717 1717
-    if code == "1717":
-        return "長興"
+    if meta:
+        name = clean_text(meta.get("名稱") or FALLBACK_STOCK_NAMES.get(code) or code)
+        market = clean_text(meta.get("市場") or "上市")
+        if name == code and code in FALLBACK_STOCK_NAMES:
+            name = FALLBACK_STOCK_NAMES[code]
+        return {
+            "code": code,
+            "name": name,
+            "market": market,
+            "official_close": meta.get("官方收盤"),
+            "official_volume": meta.get("官方成交股數"),
+        }
 
-    if code in FALLBACK_STOCK_NAMES:
-        return FALLBACK_STOCK_NAMES[code]
+    # 最後備援
+    return {
+        "code": code,
+        "name": FALLBACK_STOCK_NAMES.get(code, code),
+        "market": "上市",
+        "official_close": None,
+        "official_volume": None,
+    }
 
-    name = get_stock_name_from_openapi(code)
-    if name:
-        return name
 
-    name = get_stock_name_from_isin(code, 2)
-    if name:
-        return name
-
-    name = get_stock_name_from_isin(code, 4)
-    if name:
-        return name
-
-    name = get_stock_name_from_yfinance(code)
-    if name:
-        return name
-
-    return code
+def yahoo_symbols_by_meta(code, market):
+    if market == "上櫃":
+        return [f"{code}.TWO", f"{code}.TW", code]
+    return [f"{code}.TW", f"{code}.TWO", code]
 
 
 def normalize_yfinance_df(df):
@@ -243,10 +318,8 @@ def normalize_yfinance_df(df):
     return df
 
 
-def download_from_yfinance(code):
-    symbols = [f"{code}.TW", f"{code}.TWO", code]
-
-    for symbol in symbols:
+def download_from_yfinance(code, market):
+    for symbol in yahoo_symbols_by_meta(code, market):
         try:
             df = yf.download(
                 symbol,
@@ -256,12 +329,9 @@ def download_from_yfinance(code):
                 auto_adjust=False,
                 threads=False
             )
-
             df = normalize_yfinance_df(df)
-
             if df is not None and not df.empty and len(df) >= 60:
-                return df, symbol
-
+                return df, f"Yahoo {symbol}"
         except Exception:
             continue
 
@@ -269,7 +339,6 @@ def download_from_yfinance(code):
 
 
 def download_from_twse(code):
-    """TWSE 上市日線備援。"""
     try:
         today = pd.Timestamp.today()
         dfs = []
@@ -278,25 +347,16 @@ def download_from_twse(code):
             d = today - pd.DateOffset(months=i)
             date_str = d.strftime("%Y%m%d")
             url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
-            params = {
-                "response": "json",
-                "date": date_str,
-                "stockNo": code
-            }
+            params = {"response": "json", "date": date_str, "stockNo": code}
 
-            r = requests.get(url, params=params, timeout=10)
-            data = r.json()
-
+            data = request_json(url, params=params, timeout=10, tries=2)
             if data.get("stat") != "OK":
                 continue
 
             rows = data.get("data", [])
             fields = data.get("fields", [])
-
-            if not rows:
-                continue
-
-            dfs.append(pd.DataFrame(rows, columns=fields))
+            if rows:
+                dfs.append(pd.DataFrame(rows, columns=fields))
 
         if not dfs:
             return None, None
@@ -307,26 +367,18 @@ def download_from_twse(code):
             y, m, d = str(x).split("/")
             return pd.Timestamp(int(y) + 1911, int(m), int(d))
 
-        def to_float(x):
-            x = str(x).replace(",", "").replace("--", "").strip()
-            if x == "":
-                return None
-            return float(x)
-
         df = pd.DataFrame()
         df["Date"] = raw["日期"].apply(roc_to_date)
-        df["Open"] = raw["開盤價"].apply(to_float)
-        df["High"] = raw["最高價"].apply(to_float)
-        df["Low"] = raw["最低價"].apply(to_float)
-        df["Close"] = raw["收盤價"].apply(to_float)
-        df["Volume"] = raw["成交股數"].apply(to_float)
+        df["Open"] = raw["開盤價"].map(clean_num)
+        df["High"] = raw["最高價"].map(clean_num)
+        df["Low"] = raw["最低價"].map(clean_num)
+        df["Close"] = raw["收盤價"].map(clean_num)
+        df["Volume"] = raw["成交股數"].map(clean_num)
 
         df = df.dropna()
         df = df.drop_duplicates("Date").sort_values("Date").set_index("Date")
-
         if len(df) >= 60:
-            return df, "TWSE上市備援"
-
+            return df, "TWSE上市日線備援"
     except Exception:
         traceback.print_exc()
 
@@ -334,7 +386,6 @@ def download_from_twse(code):
 
 
 def download_from_tpex(code):
-    """TPEx 上櫃日線備援。"""
     try:
         today = pd.Timestamp.today()
         dfs = []
@@ -343,23 +394,18 @@ def download_from_tpex(code):
             d = today - pd.DateOffset(months=i)
             date_str = f"{d.year - 1911}/{d.month:02d}"
             url = "https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock"
-            params = {
-                "code": code,
-                "date": date_str,
-                "id": "",
-                "response": "csv"
-            }
+            params = {"code": code, "date": date_str, "id": "", "response": "csv"}
 
-            r = requests.get(url, params=params, timeout=10)
+            r = requests.get(url, params=params, headers=HEADERS, timeout=10)
             text = r.text
-
             if "日期" not in text or "收盤" not in text:
                 continue
 
             lines = [line for line in text.splitlines() if len(line.split(",")) >= 7]
-            csv_text = "\n".join(lines)
+            if not lines:
+                continue
 
-            temp = pd.read_csv(StringIO(csv_text))
+            temp = pd.read_csv(StringIO("\n".join(lines)))
             dfs.append(temp)
 
         if not dfs:
@@ -373,44 +419,43 @@ def download_from_tpex(code):
             y, m, d = x.split("/")
             return pd.Timestamp(int(y) + 1911, int(m), int(d))
 
-        def to_float(x):
-            x = str(x).replace(",", "").replace('"', "").replace("--", "").strip()
-            if x == "":
-                return None
-            return float(x)
-
         df = pd.DataFrame()
         df["Date"] = raw["日期"].apply(roc_to_date)
-        df["Open"] = raw["開盤"].apply(to_float)
-        df["High"] = raw["最高"].apply(to_float)
-        df["Low"] = raw["最低"].apply(to_float)
-        df["Close"] = raw["收盤"].apply(to_float)
-        df["Volume"] = raw["成交股數"].apply(to_float)
+        df["Open"] = raw["開盤"].map(clean_num)
+        df["High"] = raw["最高"].map(clean_num)
+        df["Low"] = raw["最低"].map(clean_num)
+        df["Close"] = raw["收盤"].map(clean_num)
+        df["Volume"] = raw["成交股數"].map(clean_num)
 
         df = df.dropna()
         df = df.drop_duplicates("Date").sort_values("Date").set_index("Date")
-
         if len(df) >= 60:
-            return df, "TPEx上櫃備援"
-
+            return df, "TPEx上櫃日線備援"
     except Exception:
         traceback.print_exc()
 
     return None, None
 
 
-def get_stock_data(code):
-    df, source = download_from_yfinance(code)
+def get_stock_data(code, market):
+    df, source = download_from_yfinance(code, market)
     if df is not None:
         return df, source
 
-    df, source = download_from_twse(code)
-    if df is not None:
-        return df, source
-
-    df, source = download_from_tpex(code)
-    if df is not None:
-        return df, source
+    if market == "上櫃":
+        df, source = download_from_tpex(code)
+        if df is not None:
+            return df, source
+        df, source = download_from_twse(code)
+        if df is not None:
+            return df, source
+    else:
+        df, source = download_from_twse(code)
+        if df is not None:
+            return df, source
+        df, source = download_from_tpex(code)
+        if df is not None:
+            return df, source
 
     return None, None
 
@@ -423,15 +468,6 @@ def series_float(series, idx=-1):
 
 
 def tick_size(price):
-    """
-    台股價格跳動單位：
-    10元以下 0.01
-    10~50元 0.05
-    50~100元 0.1
-    100~500元 0.5
-    500~1000元 1
-    1000元以上 5
-    """
     p = abs(float(price))
     if p < 10:
         return 0.01
@@ -448,13 +484,6 @@ def tick_size(price):
 
 
 def round_price_by_tick(price, mode="nearest"):
-    """
-    依台股 Tick 自動修正價位。
-    mode:
-    - nearest：四捨五入到合法跳動價
-    - up：往上修正，適合突破買點、空方停損
-    - down：往下修正，適合停損、跌破價、空方目標
-    """
     try:
         price = float(price)
         t = tick_size(price)
@@ -472,9 +501,6 @@ def round_price_by_tick(price, mode="nearest"):
 
 
 def fmt_price(x):
-    """
-    顯示合法台股價位，避免 2330 這種千元股出現 2346.79 這種不能掛單的小數。
-    """
     try:
         p = round_price_by_tick(float(x), "nearest")
         t = tick_size(p)
@@ -489,16 +515,27 @@ def fmt_price(x):
         return "-"
 
 
+def fmt_pct(x):
+    try:
+        return f"{float(x):.2f}%"
+    except Exception:
+        return "-"
+
+
 def stock_ai(code):
     try:
         code = str(code).strip()
-        stock_name = get_stock_name(code)
-        df, used_source = get_stock_data(code)
+        meta = get_stock_meta(code)
+        stock_name = meta["name"]
+        market = meta["market"]
+
+        df, used_source = get_stock_data(code, market)
 
         if df is None or df.empty or len(df) < 60:
             return f"""⚠️ HCX AI 查詢提醒
 
-股票：{code} {stock_name}
+🏷️ 股票：{code} {stock_name}
+🏛️ 市場：{market}
 
 目前查不到足夠日K資料。
 可能原因：
@@ -536,11 +573,9 @@ def stock_ai(code):
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         atr14 = float(tr.rolling(14).mean().iloc[-1])
 
-        # 主力成本估算：近20日成交量加權均價 VWAP
         volume20 = volume_series.tail(20)
         price20 = close_series.tail(20)
         total_volume20 = float(volume20.sum())
-
         if total_volume20 > 0:
             main_cost = float((price20 * volume20).sum() / total_volume20)
         else:
@@ -551,26 +586,29 @@ def stock_ai(code):
 
         if close > main_cost:
             chip_light = "🟢"
-            chip_status = "股價站在主力成本上方，籌碼相對偏強。"
+            chip_status = "股價站在估算主力成本上方，籌碼相對偏強。"
         elif close < main_cost:
             chip_light = "🔴"
-            chip_status = "股價跌到主力成本下方，短線賣壓需要留意。"
+            chip_status = "股價跌到估算主力成本下方，短線需留意賣壓。"
         else:
             chip_light = "🟡"
-            chip_status = "股價貼近主力成本，等待方向表態。"
+            chip_status = "股價貼近估算主力成本，等待方向表態。"
 
         if close > ma20 > ma60:
             trend = "偏多"
             trend_icon = "🟢🚀"
-            advice = "均線呈現多方排列，短線偏多。可觀察突破壓力或回測 MA20 不破。"
+            direction_summary = "主策略偏做多；不建議主動放空，除非跌破支撐且收不回。"
+            advice = "站上月線與季線，短線偏多。可觀察突破壓力續攻，或回測 MA20 不破後承接。"
         elif close < ma20 < ma60:
             trend = "偏空"
             trend_icon = "🔴⚠️"
-            advice = "均線呈現空方排列，短線偏弱。保守者可先觀望，避免亂接刀。"
+            direction_summary = "主策略偏做空或觀望；不建議急著做多，除非重新站回 MA20。"
+            advice = "均線呈現空方排列，短線偏弱。保守者先觀望，避免亂接刀。"
         else:
             trend = "震盪"
             trend_icon = "🟡🔄"
-            advice = "均線糾結，屬於震盪整理。等待突破壓力或跌破支撐後再決定方向。"
+            direction_summary = "震盪盤；做多等突破或支撐守住，做空等跌破支撐，不宜中間追價。"
+            advice = "目前均線糾結，屬於震盪整理。等待突破壓力或跌破支撐後再決定方向。"
 
         # 進出場點位：先算理論值，再依台股 Tick 修正成可掛單價
         breakout_buy_raw = max(high20, close)
@@ -587,13 +625,11 @@ def stock_ai(code):
         weak_stop_raw = weak_trigger_raw + atr14 * 1.5
         weak_target_raw = weak_trigger_raw - atr14 * 2.0
 
-        # 多方：突破買點往上修正，停損往下修正，目標往上修正
         breakout_buy = round_price_by_tick(breakout_buy_raw, "up")
         breakout_stop = round_price_by_tick(breakout_stop_raw, "down")
         breakout_target1 = round_price_by_tick(breakout_target1_raw, "up")
         breakout_target2 = round_price_by_tick(breakout_target2_raw, "up")
 
-        # 回測買區：低點往上，高點往下，避免給出不能掛單的價格
         pullback_low = round_price_by_tick(pullback_low_raw, "up")
         pullback_high = round_price_by_tick(pullback_high_raw, "down")
         if pullback_low > pullback_high:
@@ -603,16 +639,13 @@ def stock_ai(code):
         pullback_stop = round_price_by_tick(pullback_stop_raw, "down")
         pullback_target = round_price_by_tick(pullback_target_raw, "up")
 
-        # 空方：跌破價往下修正，停損往上修正，目標往下修正
         weak_trigger = round_price_by_tick(weak_trigger_raw, "down")
         weak_stop = round_price_by_tick(weak_stop_raw, "up")
         weak_target = round_price_by_tick(weak_target_raw, "down")
-
         ma20_recover = round_price_by_tick(ma20, "up")
         current_tick = tick_size(close)
 
         if trend == "偏多":
-            direction_summary = "🟢 主策略偏做多；不建議主動放空，除非跌破支撐且收不回。"
             plan = f"""🚀【做多價位說明】
 ✅ 進場1｜突破追價：站上 {fmt_price(breakout_buy)} 可視為轉強攻擊點
 🛡️ 停損1｜突破失敗：跌破 {fmt_price(breakout_stop)} 先保護資金
@@ -627,7 +660,6 @@ def stock_ai(code):
 🔴【做空條件】
 只有跌破 {fmt_price(weak_trigger)} 且反彈站不回，才考慮偏空。"""
         elif trend == "偏空":
-            direction_summary = "🔴 主策略偏做空或觀望；不建議急著做多，除非重新站回 MA20。"
             plan = f"""📉【做空價位說明】
 ⚠️ 進場1｜跌破放空：跌破 {fmt_price(weak_trigger)} 轉弱
 🛡️ 空方停損：站回 {fmt_price(weak_stop)} 先停損
@@ -638,7 +670,6 @@ def stock_ai(code):
 ✅ 再突破壓力：{fmt_price(breakout_buy)}
 若兩個條件都有，偏空看法要降低。"""
         else:
-            direction_summary = "🟡 目前震盪盤；做多等突破或支撐守住，做空等跌破支撐，不宜中間追價。"
             plan = f"""🔄【震盪盤多空價位】
 🟢 做多條件1｜突破壓力：{fmt_price(breakout_buy)}
 🟢 做多條件2｜支撐低接：{fmt_price(pullback_low)} ~ {fmt_price(pullback_high)}
@@ -650,25 +681,20 @@ def stock_ai(code):
 
 🧠 區間內不追高、不殺低，等方向確認。"""
 
-        # 漲跌顏色提示
-        if change > 0:
-            price_icon = "🔴📈"
-        elif change < 0:
-            price_icon = "🟢📉"
-        else:
-            price_icon = "⚪➖"
+        price_icon = "🔴📈" if change > 0 else "🟢📉" if change < 0 else "⚪➖"
 
         return f"""🌈✨ HCX AI 股票分析師 ✨🌈
 版本：{APP_VERSION}
 
 🏷️ 股票：{code} {stock_name}
+🏛️ 市場：{market}
 📡 資料來源：{used_source}
 
 ━━━━━━━━━━━━━━
 {price_icon}【即時價格雷達】
 💰 現價：{fmt_price(close)}
 📊 漲跌：{fmt_price(change)}
-📈 漲跌幅：{pct:.2f}%
+📈 漲跌幅：{fmt_pct(pct)}
 
 ━━━━━━━━━━━━━━
 📐【均線結構】
@@ -680,7 +706,7 @@ def stock_ai(code):
 ━━━━━━━━━━━━━━
 {chip_light}【主力成本估算】
 🏦 主力成本：{fmt_price(main_cost)}
-📏 成本乖離：{fmt_price(main_cost_diff)} / {main_cost_pct:.2f}%
+📏 成本乖離：{fmt_price(main_cost_diff)} / {fmt_pct(main_cost_pct)}
 🧩 籌碼判斷：{chip_status}
 
 ━━━━━━━━━━━━━━
@@ -702,7 +728,7 @@ def stock_ai(code):
 🧮【台股 Tick 價格修正】
 目前股價級距 Tick：{fmt_price(current_tick)} 元
 ✅ 下方進出場價位已自動修正成可掛單價位
-✅ 例如千元股會用 5 元跳動，不會再出現 2346.79 這種小數價
+✅ 千元股會用 5 元跳動，不會再出現不合法小數價
 
 ━━━━━━━━━━━━━━
 {plan}
@@ -710,7 +736,7 @@ def stock_ai(code):
 ━━━━━━━━━━━━━━
 ⚠️ 風險提醒
 本訊息為程式估算與技術分析，不代表保證獲利。
-主力成本使用近20日成交量加權均價估算，非券商實際成本。
+主力成本為近20日成交量加權均價估算，非券商實際持股成本。
 """
 
     except Exception as e:
@@ -753,13 +779,18 @@ def handle_message(event):
     raw_msg = event.message.text.strip()
     msg = raw_msg.replace("\n", "").replace("/", "").replace("股票", "").strip()
 
-    # 支援「2330」、「/2330」、「股票2330」、「請查2330」
+    # 支援：2330、/2330、股票2330、請查2330
     match = re.search(r"(\d{4})", msg)
 
     try:
         if match:
             code = match.group(1)
             reply = stock_ai(code)
+        elif "版本" in msg:
+            reply = f"HCX AI 股票分析師目前版本：{APP_VERSION}"
+        elif "更新名稱" in msg or "清除快取" in msg:
+            fetch_market_meta(force=True)
+            reply = "✅ 已重新抓取 TWSE / TPEx 官方股票名稱快取。請再輸入股票代號測試。"
         else:
             reply = f"""🌈 HCX AI 股票分析師
 
@@ -780,7 +811,11 @@ def handle_message(event):
 ✅ 做空價位
 ✅ 停損點
 ✅ 目標價
-✅ 台股Tick合法價位
+✅ 台股 Tick 合法價位
+
+指令：
+輸入「版本」可確認目前是否已部署最新版。
+輸入「更新名稱」可重新抓取官方股票名稱快取。
 """
 
         print("========== 準備回覆 ==========", flush=True)
