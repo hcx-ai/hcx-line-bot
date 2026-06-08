@@ -36,7 +36,7 @@ import requests
 # 4. 加入做多 / 做空價位說明
 # ============================================================
 
-APP_VERSION = "V5.8 會員限定極速版｜5分K進停利＋30分K停損＋隱藏依據"
+APP_VERSION = "V5.9 會員限定版｜選股日報核心＋職業當沖TOP5"
 
 app = Flask(__name__)
 
@@ -918,8 +918,6 @@ def stock_ai(code):
 🌙 20日波段VWAP：{fmt_price(cost_info["cost20"])}
 🔥 60日大量成本：{fmt_price(cost_info["cluster60"])}
 📏 現價距主控成本：{fmt_price(main_cost_diff)} / {fmt_pct(main_cost_pct)}
-🧠 算法模式：{cost_info["mode"]}
-🧩 籌碼判斷：{chip_status}
 
 ━━━━━━━━━━━━━━
 🧱【支撐壓力】
@@ -964,6 +962,7 @@ QUANTUM_COMMANDS = {
     "當沖多": "intraday_long",
     "當沖空": "intraday_short",
     "隔日沖": "swing",
+    "當沖股": "intraday_best",
 }
 
 def normalize_command_text(text):
@@ -995,6 +994,7 @@ def detect_quantum_command(raw_text):
     """
     t = normalize_command_text(raw_text)
 
+    best_words = ["當沖股", "今日當沖", "最佳當沖", "當沖名單", "當沖前五", "當沖5", "當沖"]
     long_words = ["當沖多", "當衝多", "沖多", "衝多", "當日多", "當沖做多", "當衝做多"]
     short_words = ["當沖空", "當衝空", "沖空", "衝空", "當日空", "當沖做空", "當衝做空"]
     swing_words = ["隔日沖", "隔日衝", "隔日", "隔日多", "隔日沖多", "隔日衝多"]
@@ -1005,6 +1005,8 @@ def detect_quantum_command(raw_text):
         return "當沖空"
     if any(w in t for w in swing_words):
         return "隔日沖"
+    if any(w in t for w in best_words):
+        return "當沖股"
 
     return None
 
@@ -1539,6 +1541,10 @@ def build_quantum_trade_plan(code, market, kind, close, high20, low20, atr):
 
 
 def score_quantum_candidate(df, kind, code=None, market=None):
+    """
+    V5.9：保留每檔日K特徵，排名改由「選股日報核心」做橫向比較。
+    這裡只做單檔資料整理，不在會員訊息中揭露完整算法。
+    """
     close_series = pd.to_numeric(df["Close"], errors="coerce")
     high_series = pd.to_numeric(df["High"], errors="coerce")
     low_series = pd.to_numeric(df["Low"], errors="coerce")
@@ -1548,71 +1554,238 @@ def score_quantum_candidate(df, kind, code=None, market=None):
     prev = float(close_series.iloc[-2])
     pct = (close - prev) / prev * 100 if prev else 0
 
+    day_high = float(high_series.iloc[-1])
+    day_low = float(low_series.iloc[-1])
+    amplitude = (day_high - day_low) / close * 100 if close else 0
+
     ma5 = float(close_series.rolling(5).mean().iloc[-1])
+    ma10 = float(close_series.rolling(10).mean().iloc[-1])
     ma20 = float(close_series.rolling(20).mean().iloc[-1])
     ma60 = float(close_series.rolling(60).mean().iloc[-1])
     high20 = float(high_series.tail(20).max())
     low20 = float(low_series.tail(20).min())
     pos20 = (close - low20) / (high20 - low20) * 100 if high20 > low20 else 50
 
+    volume = float(vol_series.iloc[-1]) if not pd.isna(vol_series.iloc[-1]) else 0.0
     vol_ma20 = float(vol_series.rolling(20).mean().iloc[-1])
-    vol_ratio = float(vol_series.iloc[-1] / vol_ma20) if vol_ma20 > 0 else 0
+    vol_ratio = float(volume / vol_ma20) if vol_ma20 > 0 else 0
+    value_m = close * volume / 1_000_000.0
     atr = calc_atr14(high_series, low_series, close_series)
 
-    vol_score = min(max(vol_ratio / 2.0 * 100, 0), 100)
+    win_rate, samples = estimate_strategy_win_rate(df, kind if kind != "intraday_best" else "intraday_long")
 
-    if kind == "intraday_long":
-        trend_score = 100 if close > ma5 >= ma20 else 70 if close > ma20 else 40
-        pct_score = min(max((pct + 2) / 7 * 100, 0), 100)
-        pos_score = min(max(pos20, 0), 100)
-        score = vol_score * 0.25 + trend_score * 0.30 + pct_score * 0.20 + pos_score * 0.25
-        signal = "當沖多｜前日支撐承接"
-
-    elif kind == "intraday_short":
-        trend_score = 100 if close < ma5 <= ma20 else 70 if close < ma20 else 40
-        pct_score = min(max((-pct + 2) / 7 * 100, 0), 100)
-        pos_score = min(max(100 - pos20, 0), 100)
-        score = vol_score * 0.25 + trend_score * 0.30 + pct_score * 0.20 + pos_score * 0.25
-        signal = "當沖空｜跌破前日支撐"
-
-    else:
-        trend_score = 100 if close > ma20 else 70 if close > ma60 else 45
-        pct_score = min(max((pct + 2) / 8 * 100, 0), 100)
-        pos_score = min(max(pos20, 0), 100)
-        score = vol_score * 0.30 + trend_score * 0.25 + pct_score * 0.20 + pos_score * 0.25
-        signal = "隔日沖｜前日支撐承接"
-
-    win_rate, samples = estimate_strategy_win_rate(df, kind)
-    sample_factor = min(samples / 8, 1.0)
-    rank_score = win_rate * (0.70 * sample_factor + 0.35 * (1 - sample_factor)) + score * (0.30 * sample_factor + 0.65 * (1 - sample_factor))
-
-    # 極速版：這裡不抓5分K，避免每檔都下載盤中資料。
-    # 排名完成後，只對前5名抓前日12:30~13:30支撐，速度會快很多。
     return {
         "close": close,
         "pct": pct,
-        "score": score,
-        "win_rate": win_rate,
-        "samples": samples,
-        "rank_score": rank_score,
+        "volume": volume,
+        "value_m": value_m,
+        "day_high": day_high,
+        "day_low": day_low,
+        "amplitude": amplitude,
+        "ma5": ma5,
+        "ma10": ma10,
+        "ma20": ma20,
+        "ma60": ma60,
+        "pos20": pos20,
         "vol_ratio": vol_ratio,
         "atr": atr,
         "high20": high20,
         "low20": low20,
+        "win_rate": win_rate,
+        "samples": samples,
+        "score": 0.0,
+        "rank_score": 0.0,
         "entry": None,
         "take_profit": None,
         "stop": None,
-        "basis": "待計算",
-        "signal": signal,
+        "basis": "",
+        "signal": "職業當沖觀察",
+        "trade_kind": kind,
     }
 
 
+def _percentile_list(values):
+    s = pd.to_numeric(pd.Series(values), errors="coerce").replace([float("inf"), float("-inf")], pd.NA).fillna(0)
+    if len(s) <= 1 or s.nunique() <= 1:
+        return [50.0] * len(s)
+    return (s.rank(pct=True) * 100).tolist()
+
+
+def _clip_score(x, lo=0, hi=100):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return 0.0
+
+
+def _healthy_momentum_score(pct, side):
+    """把太極端的漲跌停附近降權，優先選好操作、不容易一開盤就失控的股票。"""
+    pct = float(pct or 0)
+    if side == "long":
+        if 0.8 <= pct <= 5.8:
+            return 100.0
+        if -1.5 <= pct < 0.8:
+            return _clip_score((pct + 1.5) / 2.3 * 82)
+        if 5.8 < pct <= 8.8:
+            return _clip_score((8.8 - pct) / 3.0 * 85)
+        return 20.0 if pct > 8.8 else 5.0
+    if side == "short":
+        ap = -pct
+        if 0.8 <= ap <= 5.8:
+            return 100.0
+        if -1.5 <= ap < 0.8:
+            return _clip_score((ap + 1.5) / 2.3 * 82)
+        if 5.8 < ap <= 8.8:
+            return _clip_score((8.8 - ap) / 3.0 * 85)
+        return 20.0 if ap > 8.8 else 5.0
+    return 50.0
+
+
+def _operability_score(row):
+    """職業當沖可操作性：流動性、波動、價格級距、追價風險。"""
+    close = float(row.get("close") or 0)
+    amplitude = abs(float(row.get("amplitude") or 0))
+    vol_ratio = float(row.get("vol_ratio") or 0)
+    value_m = float(row.get("value_m") or 0)
+
+    if 15 <= close <= 300:
+        price_score = 100
+    elif 8 <= close < 15 or 300 < close <= 650:
+        price_score = 72
+    else:
+        price_score = 45
+
+    if 1.2 <= amplitude <= 7.5:
+        amp_score = 100
+    elif amplitude < 1.2:
+        amp_score = _clip_score(amplitude / 1.2 * 80)
+    elif amplitude <= 12:
+        amp_score = _clip_score((12 - amplitude) / 4.5 * 85)
+    else:
+        amp_score = 25
+
+    vol_ratio_score = _clip_score(vol_ratio / 2.2 * 100)
+    value_score = _clip_score(value_m / 350 * 100)
+    tick_risk = tick_size(close) / close * 100 if close else 5
+    tick_score = 100 if tick_risk <= 0.18 else 75 if tick_risk <= 0.35 else 50
+
+    return price_score * 0.20 + amp_score * 0.25 + vol_ratio_score * 0.25 + value_score * 0.20 + tick_score * 0.10
+
+
+def apply_hcx_daily_radar_ranking(command, rows):
+    """
+    依照使用者上傳的黑暗量子選股日報精神：
+    - 先做全體候選的量能/金額百分位
+    - 當沖多看多方分數
+    - 當沖空看空方分數
+    - 隔日沖看隔日沖分數
+    - 額外加入職業操盤可操作性，最後只取前5名
+    """
+    if not rows:
+        return []
+
+    vols = [r.get("volume", 0) for r in rows]
+    vals = [r.get("value_m", 0) for r in rows]
+    volume_scores = _percentile_list(vols)
+    value_scores = _percentile_list(vals)
+
+    ranked = []
+    for r, volume_score, value_score in zip(rows, volume_scores, value_scores):
+        pct = float(r.get("pct") or 0)
+        pos20 = _clip_score(r.get("pos20", 50))
+        amplitude = float(r.get("amplitude") or 0)
+        oper = _operability_score(r)
+        win_rate = float(r.get("win_rate") or 50)
+        samples = int(r.get("samples") or 0)
+        sample_factor = min(samples / 12, 1.0)
+
+        long_pct_score = _clip_score(max(pct, 0) / 10 * 100)
+        short_pct_score = _clip_score(max(-pct, 0) / 10 * 100)
+        long_pos_score = pos20
+        short_pos_score = 100 - pos20
+
+        # 與黑暗量子雷達一致的四權重精神：量能、金額、漲跌幅、收盤位置。
+        long_score = volume_score * 0.28 + value_score * 0.22 + long_pct_score * 0.30 + long_pos_score * 0.20
+        short_score = volume_score * 0.28 + value_score * 0.22 + short_pct_score * 0.30 + short_pos_score * 0.20
+
+        # 隔日沖用健康漲幅、量價、收盤位置、振幅平衡，避免只追最強漲幅。
+        momentum = _healthy_momentum_score(pct, "long")
+        if 1.2 <= amplitude <= 6.8:
+            amp_score = 100.0
+        elif amplitude < 1.2:
+            amp_score = _clip_score((amplitude - 0.1) / 1.1 * 100)
+        elif amplitude < 12.0:
+            amp_score = _clip_score((12.0 - amplitude) / 5.2 * 100)
+        else:
+            amp_score = 20.0
+        liquidity = volume_score * 0.52 + value_score * 0.48
+        swing_score = liquidity * 0.28 + pos20 * 0.30 + momentum * 0.28 + amp_score * 0.14
+
+        # 職業當沖綜合分：原始選股分數為主，勝率/可操作性為輔。
+        pro_long = long_score * 0.48 + win_rate * (0.22 * sample_factor + 0.10 * (1 - sample_factor)) + oper * 0.30
+        pro_short = short_score * 0.48 + win_rate * (0.22 * sample_factor + 0.10 * (1 - sample_factor)) + oper * 0.30
+        pro_swing = swing_score * 0.52 + win_rate * (0.22 * sample_factor + 0.10 * (1 - sample_factor)) + oper * 0.26
+
+        rr = dict(r)
+        rr["volume_score"] = volume_score
+        rr["value_score"] = value_score
+        rr["long_score"] = long_score
+        rr["short_score"] = short_score
+        rr["swing_score"] = swing_score
+        rr["operability_score"] = oper
+
+        if command == "當沖多":
+            rr["score"] = long_score
+            rr["rank_score"] = pro_long
+            rr["trade_kind"] = "intraday_long"
+            rr["signal"] = "🟥 偏多當沖"
+            keep = long_score >= 45 and pct > -8.8 and oper >= 45
+        elif command == "當沖空":
+            rr["score"] = short_score
+            rr["rank_score"] = pro_short
+            rr["trade_kind"] = "intraday_short"
+            rr["signal"] = "🟩 偏空當沖"
+            keep = short_score >= 45 and pct < 8.8 and oper >= 45
+        elif command == "隔日沖":
+            rr["score"] = swing_score
+            rr["rank_score"] = pro_swing
+            rr["trade_kind"] = "swing"
+            rr["signal"] = "🟠 隔日沖觀察"
+            keep = swing_score >= 42 and pct > -6.5 and oper >= 40
+        else:
+            # 當沖股：多空都比，給當下最好操作方向。
+            if pro_short > pro_long:
+                rr["score"] = short_score
+                rr["rank_score"] = pro_short
+                rr["trade_kind"] = "intraday_short"
+                rr["signal"] = "🟩 偏空當沖"
+            else:
+                rr["score"] = long_score
+                rr["rank_score"] = pro_long
+                rr["trade_kind"] = "intraday_long"
+                rr["signal"] = "🟥 偏多當沖"
+            keep = max(long_score, short_score) >= 45 and oper >= 45
+
+        # 過熱/過冷保護：極端漲跌停附近不列為最好操作前五名。
+        if abs(pct) >= 9.75:
+            rr["rank_score"] -= 18
+        if amplitude >= 12:
+            rr["rank_score"] -= 10
+
+        if keep:
+            ranked.append(rr)
+
+    ranked = sorted(ranked, key=lambda x: (x["rank_score"], x.get("win_rate", 0), x.get("value_m", 0)), reverse=True)
+    if not ranked:
+        ranked = sorted(rows, key=lambda x: (x.get("rank_score", 0), x.get("win_rate", 0)), reverse=True)
+    return ranked[:get_quantum_top_n()]
 
 def format_quantum_top_report(command, rows):
     title_map = {
-        "當沖多": "🔴 當沖多 TOP 5｜AI勝率排行",
-        "當沖空": "🟢 當沖空 TOP 5｜AI勝率排行",
-        "隔日沖": "🟠 隔日沖 TOP 5｜AI勝率排行",
+        "當沖多": "🔴 當沖多 TOP 5｜職業操盤精選",
+        "當沖空": "🟢 當沖空 TOP 5｜職業操盤精選",
+        "隔日沖": "🟠 隔日沖 TOP 5｜選股日報精選",
+        "當沖股": "⚡ 最佳當沖股 TOP 5｜多空綜合精選",
     }
 
     if not rows:
@@ -1628,15 +1801,16 @@ def format_quantum_top_report(command, rows):
         "⚡ HCX-AI量子雷達",
         f"🕒 查詢時間：{query_time_text()}",
         f"{title_map.get(command, command)}",
-        "📦 搜尋範圍：活躍股前30名",
+        "📦 搜尋範圍：活躍股前30名｜職業當沖精選｜只列前5名",
         "━━━━━━━━━━━━━━",
     ]
 
     for idx, r in enumerate(rows[:get_quantum_top_n()], 1):
+        direction = r.get("signal", "職業當沖觀察")
         lines.append(
-            f"{idx}. {r['code']} {r['name']}\n"
+            f"{idx}. {r['code']} {r['name']}｜{direction}\n"
             f"   收盤 {fmt_price(r['close'])}｜漲跌 {r['pct']:+.2f}%｜量比 {r['vol_ratio']:.2f}\n"
-            f"   🏆 AI勝率 {r['win_rate']:.1f}%｜樣本 {r['samples']}｜分數 {r['score']:.1f}\n"
+            f"   🏆 AI勝率 {r['win_rate']:.1f}%｜樣本 {r['samples']}｜職業評分 {r['rank_score']:.1f}\n"
             f"   🎯 建議進場價：{fmt_price(r['entry'])}\n"
             f"   ✅ 建議停利價：{fmt_price(r['take_profit'])}\n"
             f"   🛑 建議停損價：{fmt_price(r['stop'])}"
@@ -1644,13 +1818,12 @@ def format_quantum_top_report(command, rows):
 
     lines.extend([
         "━━━━━━━━━━━━━━",
-        "⚠️ 勝率為量價與歷史日K訊號估算，不保證獲利。",
-        "⚠️ 盤中建議搭配1分K轉折確認，跌破30分K支撐務必停損。",
+        "⚠️ 此為HCX-AI量子雷達篩選結果，不保證獲利。",
+        "⚠️ 當沖實戰請搭配1分K轉折、量能與停損紀律。",
     ])
 
     text = "\n".join(lines)
     return text[:4800]
-
 
 def get_quantum_workers():
     """Render 免費機不要開太大，避免被 yfinance 擋或 CPU 爆掉。"""
@@ -1662,7 +1835,7 @@ def get_quantum_workers():
 
 
 def process_quantum_item(item, kind):
-    """單檔日K評分，供 ThreadPoolExecutor 並行使用。"""
+    """單檔日K整理，供 ThreadPoolExecutor 並行使用。"""
     code = item["code"]
     meta = get_stock_meta(code)
     df, source = get_stock_data(code, meta["market"])
@@ -1672,7 +1845,8 @@ def process_quantum_item(item, kind):
 
     metrics = score_quantum_candidate(df, kind, code=code, market=meta["market"])
 
-    if metrics["score"] < 50:
+    # 基本流動性保護，避免冷門股進入當沖前五名
+    if metrics.get("close", 0) < 5 or metrics.get("value_m", 0) < 20:
         return None
 
     return {
@@ -1683,13 +1857,12 @@ def process_quantum_item(item, kind):
     }
 
 
-
 def _attach_one_trade_plan(r, kind):
     try:
         trade_plan = build_quantum_trade_plan(
             code=r["code"],
             market=r["market"],
-            kind=kind,
+            kind=r.get("trade_kind", kind),
             close=r["close"],
             high20=r["high20"],
             low20=r["low20"],
@@ -1706,14 +1879,15 @@ def _attach_one_trade_plan(r, kind):
 
     except Exception as e:
         print(f"交易計畫計算失敗 {r.get('code')}: {e}", flush=True)
-        if kind == "intraday_short":
+        actual_kind = r.get("trade_kind", kind)
+        if actual_kind == "intraday_short":
             r["entry"] = round_price_by_tick(min(r["low20"], r["close"]), "down")
             r["stop"] = round_price_by_tick(r["entry"] + max(r["atr"] * 0.70, tick_size(r["close"]) * 3), "up")
         else:
             r["entry"] = round_price_by_tick(max(r["low20"], r["close"] - r["atr"] * 0.50), "nearest")
             r["stop"] = round_price_by_tick(r["entry"] - max(r["atr"] * 0.70, tick_size(r["close"]) * 3), "down")
 
-        r["take_profit"] = calc_take_profit_by_60_percent(r["entry"], r["stop"], kind)
+        r["take_profit"] = calc_take_profit_by_60_percent(r["entry"], r["stop"], actual_kind)
         r["basis"] = ""
         r["support5"] = None
         r["resistance5"] = None
@@ -1753,12 +1927,11 @@ def attach_trade_plan_to_top_rows(rows, kind):
 def run_quantum_scan(command):
     kind = QUANTUM_COMMANDS.get(command)
     if not kind:
-        return "指令錯誤，請輸入：當沖多、當沖空、隔日沖"
+        return "指令錯誤，請輸入：當沖股、當沖多、當沖空、隔日沖"
 
     universe = get_quantum_universe()
     results = []
 
-    # 極速版：30檔日K並行下載與評分
     workers = get_quantum_workers()
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(process_quantum_item, item, kind) for item in universe]
@@ -1771,9 +1944,10 @@ def run_quantum_scan(command):
                 print(f"量子並行掃描略過：{e}", flush=True)
                 continue
 
-    results = sorted(results, key=lambda x: (x["rank_score"], x["win_rate"], x["score"]), reverse=True)
+    # V5.9：依照黑暗量子選股日報的橫向分數精神，重新排序選出前5名。
+    results = apply_hcx_daily_radar_ranking(command, results)
 
-    # 只對前5名補盤中支撐/進場/停利/停損，避免等很久。
+    # 只對前5名補分K進場/停利/停損，維持速度。
     results = attach_trade_plan_to_top_rows(results, kind)
     return format_quantum_top_report(command, results)
 
@@ -1809,8 +1983,8 @@ def start_quantum_scan(user_id, command):
 
 系統正在啟動HCX-AI量子雷達極速掃描中...
 
-📊 掃描模式：AI勝率排行 TOP 5
-📦 搜尋範圍：活躍股前30名
+📊 掃描模式：選股日報核心 TOP 5
+📦 搜尋範圍：活躍股前30名｜職業當沖精選
 🕒 查詢時間：{query_time_text()}
 
 稍後會自動推播結果給你。
@@ -1937,11 +2111,13 @@ def handle_message(event):
 ✅ 目標價
 
 量子選股指令：
+⚡ 輸入「當沖股」：列出最好操作的當沖股 TOP 5
 🔴 輸入「當沖多」：列出當沖多 TOP 5
 🟢 輸入「當沖空」：列出當沖空 TOP 5
 🟠 輸入「隔日沖」：列出隔日沖 TOP 5
 
 也支援：
+/當沖股、今日當沖、最佳當沖、當沖
 /當沖多、當沖 多、當衝多、我要當沖多
 /當沖空、當沖 空、當衝空、我要當沖空
 /隔日沖、隔日衝
