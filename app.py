@@ -1,18 +1,27 @@
-```python
 from flask import Flask, request
-from linebot import LineBotApi, WebhookHandler
-from linebot.models import TextSendMessage
-from linebot.exceptions import InvalidSignatureError
-from linebot.models.events import MessageEvent
-from linebot.models.messages import TextMessage
+from linebot.v3.webhook import WebhookHandler
+from linebot.v3.messaging import (
+    Configuration,
+    ApiClient,
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage
+)
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import os
 import traceback
 import yfinance as yf
 
 app = Flask(__name__)
 
-line_bot_api = LineBotApi(os.environ["LINE_CHANNEL_ACCESS_TOKEN"])
-handler = WebhookHandler(os.environ["LINE_CHANNEL_SECRET"])
+configuration = Configuration(
+    access_token=os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+)
+
+handler = WebhookHandler(
+    os.environ["LINE_CHANNEL_SECRET"]
+)
 
 
 def stock_ai(code):
@@ -23,7 +32,13 @@ def stock_ai(code):
         used_symbol = None
 
         for symbol in symbols:
-            temp = yf.download(symbol, period="6mo", interval="1d", progress=False, auto_adjust=False)
+            temp = yf.download(
+                symbol,
+                period="6mo",
+                interval="1d",
+                progress=False,
+                auto_adjust=False
+            )
 
             if temp is not None and not temp.empty:
                 df = temp
@@ -109,7 +124,7 @@ def callback():
     return "OK"
 
 
-@handler.add(MessageEvent, message=TextMessage)
+@handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     print("========== 收到使用者訊息 ==========", flush=True)
     print(event.message.text, flush=True)
@@ -125,10 +140,17 @@ def handle_message(event):
         print("========== 準備回覆 ==========", flush=True)
         print(reply, flush=True)
 
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=reply)
-        )
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[
+                        TextMessage(text=reply)
+                    ]
+                )
+            )
 
         print("========== 回覆成功 ==========", flush=True)
 
@@ -140,4 +162,3 @@ def handle_message(event):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-```
