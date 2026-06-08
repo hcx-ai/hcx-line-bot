@@ -17,6 +17,7 @@ import math
 import time
 import traceback
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from io import StringIO
 
@@ -35,7 +36,7 @@ import requests
 # 4. 加入做多 / 做空價位說明
 # ============================================================
 
-APP_VERSION = "V5.6 會員限定版｜量子TOP5＋前30名掃描＋前日1230支撐進場價"
+APP_VERSION = "V5.7 會員限定極速版｜量子TOP5＋前30名極速掃描＋實際進停利損"
 
 app = Flask(__name__)
 
@@ -1212,31 +1213,64 @@ def _signal_success(df, i, feat, kind):
     return (next_high >= target) or (next_close > entry)
 
 
-def estimate_strategy_win_rate(df, kind, lookback=120):
+def estimate_strategy_win_rate(df, kind, lookback=80):
     """
-    回測同類型訊號的隔日結果，回傳勝率與樣本數。
+    極速版回測勝率：改成向量化計算，避免每一根K棒都重新算 rolling。
+    速度比原本逐列迴圈快很多。
     """
     try:
         if df is None or df.empty or len(df) < 80:
             return 50.0, 0
 
-        start = max(60, len(df) - lookback)
-        wins = 0
-        samples = 0
+        close = pd.to_numeric(df["Close"], errors="coerce")
+        high = pd.to_numeric(df["High"], errors="coerce")
+        low = pd.to_numeric(df["Low"], errors="coerce")
+        vol = pd.to_numeric(df["Volume"], errors="coerce")
 
-        for i in range(start, len(df) - 1):
-            try:
-                feat = _signal_features(df, i)
-                if _is_signal(feat, kind):
-                    samples += 1
-                    if _signal_success(df, i, feat, kind):
-                        wins += 1
-            except Exception:
-                continue
+        prev = close.shift(1)
+        pct = (close - prev) / prev * 100
+        ma5 = close.rolling(5).mean()
+        ma20 = close.rolling(20).mean()
+        ma60 = close.rolling(60).mean()
+        high20 = high.rolling(20).max()
+        low20 = low.rolling(20).min()
+        vol_ma20 = vol.rolling(20).mean()
+        vol_ratio = vol / vol_ma20
+        pos20 = (close - low20) / (high20 - low20) * 100
+
+        tr = pd.concat([
+            high - low,
+            (high - prev).abs(),
+            (low - prev).abs()
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean()
+
+        if kind == "intraday_long":
+            sig = (close > ma5) & (ma5 >= ma20) & (pos20 >= 60) & (vol_ratio >= 0.90) & (pct >= -1.0)
+            target = close + atr.fillna(close * 0.015) * 0.60
+            stop = close - atr.fillna(close * 0.015) * 0.45
+            success = ((high.shift(-1) >= target) & (low.shift(-1) > stop)) | (close.shift(-1) > close)
+
+        elif kind == "intraday_short":
+            sig = (close < ma5) & (ma5 <= ma20) & (pos20 <= 45) & (vol_ratio >= 0.90) & (pct <= 1.0)
+            target = close - atr.fillna(close * 0.015) * 0.60
+            stop = close + atr.fillna(close * 0.015) * 0.45
+            success = ((low.shift(-1) <= target) & (high.shift(-1) < stop)) | (close.shift(-1) < close)
+
+        else:
+            sig = (vol_ratio >= 0.85) & (pos20 >= 45) & (pct >= -2.5) & (close >= ma20 * 0.96)
+            target = close + atr.fillna(close * 0.015) * 0.50
+            success = (high.shift(-1) >= target) | (close.shift(-1) > close)
+
+        # 只看最近 lookback 根，且排除最後一根，因為需要隔日結果。
+        start = max(60, len(df) - lookback)
+        valid = sig.iloc[start:-1].fillna(False)
+        samples = int(valid.sum())
 
         if samples <= 0:
             return 50.0, 0
 
+        wins = int(success.iloc[start:-1][valid].fillna(False).sum())
         return wins / samples * 100, samples
 
     except Exception:
@@ -1454,36 +1488,28 @@ def score_quantum_candidate(df, kind, code=None, market=None):
         pct_score = min(max((pct + 2) / 7 * 100, 0), 100)
         pos_score = min(max(pos20, 0), 100)
         score = vol_score * 0.25 + trend_score * 0.30 + pct_score * 0.20 + pos_score * 0.25
-        signal = "當沖多｜支撐承接"
+        signal = "當沖多｜前日支撐承接"
 
     elif kind == "intraday_short":
         trend_score = 100 if close < ma5 <= ma20 else 70 if close < ma20 else 40
         pct_score = min(max((-pct + 2) / 7 * 100, 0), 100)
         pos_score = min(max(100 - pos20, 0), 100)
         score = vol_score * 0.25 + trend_score * 0.30 + pct_score * 0.20 + pos_score * 0.25
-        signal = "當沖空｜跌破支撐"
+        signal = "當沖空｜跌破前日支撐"
 
     else:
         trend_score = 100 if close > ma20 else 70 if close > ma60 else 45
         pct_score = min(max((pct + 2) / 8 * 100, 0), 100)
         pos_score = min(max(pos20, 0), 100)
         score = vol_score * 0.30 + trend_score * 0.25 + pct_score * 0.20 + pos_score * 0.25
-        signal = "隔日沖｜支撐承接"
+        signal = "隔日沖｜前日支撐承接"
 
     win_rate, samples = estimate_strategy_win_rate(df, kind)
     sample_factor = min(samples / 8, 1.0)
     rank_score = win_rate * (0.70 * sample_factor + 0.35 * (1 - sample_factor)) + score * (0.30 * sample_factor + 0.65 * (1 - sample_factor))
 
-    trade_plan = build_quantum_trade_plan(
-        code=code or "",
-        market=market or "上市",
-        kind=kind,
-        close=close,
-        high20=high20,
-        low20=low20,
-        atr=atr
-    )
-
+    # 極速版：這裡不抓5分K，避免每檔都下載盤中資料。
+    # 排名完成後，只對前5名抓前日12:30~13:30支撐，速度會快很多。
     return {
         "close": close,
         "pct": pct,
@@ -1492,12 +1518,16 @@ def score_quantum_candidate(df, kind, code=None, market=None):
         "samples": samples,
         "rank_score": rank_score,
         "vol_ratio": vol_ratio,
-        "entry": trade_plan["entry"],
-        "take_profit": trade_plan["take_profit"],
-        "stop": trade_plan["stop"],
-        "basis": trade_plan["basis"],
+        "atr": atr,
+        "high20": high20,
+        "low20": low20,
+        "entry": None,
+        "take_profit": None,
+        "stop": None,
+        "basis": "待計算",
         "signal": signal,
     }
+
 
 
 def format_quantum_top_report(command, rows):
@@ -1508,8 +1538,7 @@ def format_quantum_top_report(command, rows):
     }
 
     if not rows:
-        return f"""⚡ HCX 黑暗量子 LINE 雷達
-
+        return f"""⚡ HCX-AI量子雷達
 🕒 查詢時間：{query_time_text()}
 📌 指令：{command}
 
@@ -1518,7 +1547,7 @@ def format_quantum_top_report(command, rows):
 """
 
     lines = [
-        "⚡ HCX 黑暗量子 LINE 雷達",
+        "⚡ HCX-AI量子雷達",
         f"🕒 查詢時間：{query_time_text()}",
         f"{title_map.get(command, command)}",
         "📦 搜尋範圍：活躍股前30名",
@@ -1546,6 +1575,76 @@ def format_quantum_top_report(command, rows):
     return text[:4800]
 
 
+def get_quantum_workers():
+    """Render 免費機不要開太大，避免被 yfinance 擋或 CPU 爆掉。"""
+    try:
+        n = int(os.environ.get("QUANTUM_WORKERS", "8"))
+        return max(3, min(n, 10))
+    except Exception:
+        return 8
+
+
+def process_quantum_item(item, kind):
+    """單檔日K評分，供 ThreadPoolExecutor 並行使用。"""
+    code = item["code"]
+    meta = get_stock_meta(code)
+    df, source = get_stock_data(code, meta["market"])
+
+    if df is None or df.empty or len(df) < 80:
+        return None
+
+    metrics = score_quantum_candidate(df, kind, code=code, market=meta["market"])
+
+    if metrics["score"] < 50:
+        return None
+
+    return {
+        "code": code,
+        "name": meta["name"],
+        "market": meta["market"],
+        **metrics,
+    }
+
+
+def attach_trade_plan_to_top_rows(rows, kind):
+    """
+    只對前5名計算前日 12:30~13:30 支撐與進停利損。
+    這是速度優化關鍵：不再對30檔全部抓5分K。
+    """
+    top_n = get_quantum_top_n()
+    final_rows = []
+
+    for r in rows[:top_n]:
+        try:
+            trade_plan = build_quantum_trade_plan(
+                code=r["code"],
+                market=r["market"],
+                kind=kind,
+                close=r["close"],
+                high20=r["high20"],
+                low20=r["low20"],
+                atr=r["atr"]
+            )
+            r["entry"] = trade_plan["entry"]
+            r["take_profit"] = trade_plan["take_profit"]
+            r["stop"] = trade_plan["stop"]
+            r["basis"] = trade_plan["basis"]
+        except Exception as e:
+            print(f"交易計畫計算失敗 {r.get('code')}: {e}", flush=True)
+            # 保障一定有數字，不回傳文字占位
+            if kind == "intraday_short":
+                r["entry"] = round_price_by_tick(min(r["low20"], r["close"]), "down")
+                r["stop"] = round_price_by_tick(r["entry"] + max(r["atr"] * 0.70, tick_size(r["close"]) * 3), "up")
+            else:
+                r["entry"] = round_price_by_tick(max(r["low20"], r["close"] - r["atr"] * 0.50), "nearest")
+                r["stop"] = round_price_by_tick(r["entry"] - max(r["atr"] * 0.70, tick_size(r["close"]) * 3), "down")
+            r["take_profit"] = calc_take_profit_by_60_percent(r["entry"], r["stop"], kind)
+            r["basis"] = "日K備援計算"
+
+        final_rows.append(r)
+
+    return final_rows
+
 def run_quantum_scan(command):
     kind = QUANTUM_COMMANDS.get(command)
     if not kind:
@@ -1554,34 +1653,23 @@ def run_quantum_scan(command):
     universe = get_quantum_universe()
     results = []
 
-    for item in universe:
-        try:
-            code = item["code"]
-            meta = get_stock_meta(code)
-            df, source = get_stock_data(code, meta["market"])
-
-            if df is None or df.empty or len(df) < 80:
+    # 極速版：30檔日K並行下載與評分
+    workers = get_quantum_workers()
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(process_quantum_item, item, kind) for item in universe]
+        for fut in as_completed(futures):
+            try:
+                r = fut.result()
+                if r is not None:
+                    results.append(r)
+            except Exception as e:
+                print(f"量子並行掃描略過：{e}", flush=True)
                 continue
 
-            metrics = score_quantum_candidate(df, kind, code=code, market=meta["market"])
-
-            # 低分先濾掉，避免冷門或方向不明股票亂入
-            if metrics["score"] < 50:
-                continue
-
-            results.append({
-                "code": code,
-                "name": meta["name"],
-                "market": meta["market"],
-                **metrics,
-            })
-
-        except Exception as e:
-            print(f"量子掃描略過 {item.get('code')}: {e}", flush=True)
-            continue
-
-    # 以 AI勝率與分數綜合排序；勝率高且分數高排前面
     results = sorted(results, key=lambda x: (x["rank_score"], x["win_rate"], x["score"]), reverse=True)
+
+    # 只對前5名補盤中支撐/進場/停利/停損，避免等很久。
+    results = attach_trade_plan_to_top_rows(results, kind)
     return format_quantum_top_report(command, results)
 
 
@@ -1614,10 +1702,10 @@ def start_quantum_scan(user_id, command):
 
     return f"""⚡ 已收到「{command}」指令
 
-系統正在啟動HCX-AI量子雷達掃描中...
+系統正在啟動HCX-AI量子雷達極速掃描中...
 
 📊 掃描模式：AI勝率排行 TOP 5
-📦 掃描檔數：前30檔活躍股
+📦 搜尋範圍：活躍股前30名
 🕒 查詢時間：{query_time_text()}
 
 稍後會自動推播結果給你。
