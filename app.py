@@ -36,7 +36,7 @@ import requests
 # 4. 加入做多 / 做空價位說明
 # ============================================================
 
-APP_VERSION = "V5.7 會員限定極速版｜量子TOP5＋前30名極速掃描＋實際進停利損"
+APP_VERSION = "V5.8 會員限定極速版｜5分K進停利＋30分K停損＋隱藏依據"
 
 app = Flask(__name__)
 
@@ -1277,109 +1277,188 @@ def estimate_strategy_win_rate(df, kind, lookback=80):
         return 50.0, 0
 
 
-def get_prev_1230_1330_levels(code, market):
+
+_INTRADAY_LEVEL_CACHE = {}
+
+
+def _normalize_intraday_df(df_i):
+    if df_i is None or df_i.empty:
+        return None
+
+    if isinstance(df_i.columns, pd.MultiIndex):
+        df_i.columns = [c[0] if isinstance(c, tuple) else c for c in df_i.columns]
+
+    need_cols = ["High", "Low", "Close"]
+    for c in need_cols:
+        if c not in df_i.columns:
+            return None
+
+    df_i = df_i[need_cols].copy()
+    for c in need_cols:
+        df_i[c] = pd.to_numeric(df_i[c], errors="coerce")
+
+    df_i = df_i.dropna()
+    if df_i.empty:
+        return None
+
+    idx = pd.to_datetime(df_i.index)
+    try:
+        if idx.tz is None:
+            idx = idx.tz_localize("Asia/Taipei")
+        else:
+            idx = idx.tz_convert("Asia/Taipei")
+    except Exception:
+        pass
+
+    df_i.index = idx
+    return df_i
+
+
+def get_yf_intraday(code, market, interval="5m", period="5d"):
     """
-    取得前一個交易日 12:30~13:30 的盤中支撐/壓力。
-    進場價核心：
-    - 當沖多 / 隔日沖：以前日 12:30~13:30 支撐做建議進場價
-    - 當沖空：以跌破前日 12:30~13:30 支撐做偏空進場觀察
+    只針對 TOP5 計算分K，不對30檔全部抓分K。
+    加上快取，當沖多/當沖空連續查詢時速度會比較快。
     """
+    cache_key = (str(code), str(market), str(interval), str(period))
+    cached = _INTRADAY_LEVEL_CACHE.get(cache_key)
+    now = time.time()
+
+    # 快取 10 分鐘，避免短時間重複查詢拖慢速度
+    if cached and now - cached.get("ts", 0) < 600:
+        return cached.get("df")
+
     symbols = yahoo_symbols_by_meta(code, market)
 
     for symbol in symbols:
         try:
             df_i = yf.download(
                 symbol,
-                period="7d",
-                interval="5m",
+                period=period,
+                interval=interval,
                 progress=False,
                 auto_adjust=False,
                 threads=False,
                 prepost=False
             )
+            df_i = _normalize_intraday_df(df_i)
 
-            if df_i is None or df_i.empty:
-                continue
-
-            if isinstance(df_i.columns, pd.MultiIndex):
-                df_i.columns = [c[0] if isinstance(c, tuple) else c for c in df_i.columns]
-
-            if "High" not in df_i.columns or "Low" not in df_i.columns or "Close" not in df_i.columns:
-                continue
-
-            df_i = df_i[["High", "Low", "Close"]].copy()
-            df_i["High"] = pd.to_numeric(df_i["High"], errors="coerce")
-            df_i["Low"] = pd.to_numeric(df_i["Low"], errors="coerce")
-            df_i["Close"] = pd.to_numeric(df_i["Close"], errors="coerce")
-            df_i = df_i.dropna()
-
-            if df_i.empty:
-                continue
-
-            idx = pd.to_datetime(df_i.index)
-            try:
-                if idx.tz is None:
-                    # 台股 yfinance 有時回傳無時區，這裡直接視為台北時間。
-                    idx = idx.tz_localize("Asia/Taipei")
-                else:
-                    idx = idx.tz_convert("Asia/Taipei")
-            except Exception:
-                pass
-
-            df_i.index = idx
-
-            taiwan_today = datetime.now(timezone(timedelta(hours=8))).date()
-            dates = sorted(set([x.date() for x in df_i.index if x.date() < taiwan_today]))
-
-            if not dates:
-                dates = sorted(set([x.date() for x in df_i.index]))
-
-            if not dates:
-                continue
-
-            prev_date = dates[-1]
-            t_start = datetime.strptime("12:30", "%H:%M").time()
-            t_end = datetime.strptime("13:30", "%H:%M").time()
-            window = df_i[
-                (df_i.index.date == prev_date) &
-                (df_i.index.time >= t_start) &
-                (df_i.index.time <= t_end)
-            ]
-
-            if window.empty:
-                # 若 yfinance 盤中資料不足，退而用前一交易日最後60分鐘。
-                day_df = df_i[df_i.index.date == prev_date]
-                window = day_df.tail(12)
-
-            if window.empty:
-                continue
-
-            support = float(window["Low"].min())
-            resistance = float(window["High"].max())
-            mid = float(window["Close"].iloc[-1])
-
-            return {
-                "ok": True,
-                "date": pd.Timestamp(prev_date).strftime("%Y-%m-%d"),
-                "support": support,
-                "resistance": resistance,
-                "mid": mid,
-                "source": f"{symbol} 5m",
-            }
+            if df_i is not None and not df_i.empty:
+                _INTRADAY_LEVEL_CACHE[cache_key] = {"ts": now, "df": df_i}
+                return df_i
 
         except Exception as e:
-            print(f"前日1230支撐抓取失敗 {code} {symbol}: {e}", flush=True)
+            print(f"分K抓取失敗 {code} {symbol} {interval}: {e}", flush=True)
             continue
 
-    return {
-        "ok": False,
-        "date": "",
-        "support": None,
-        "resistance": None,
-        "mid": None,
-        "source": "無盤中5分K資料，改用日K備援"
-    }
+    return None
 
+
+def _regular_session_only(df_i):
+    """
+    台股一般交易時段 09:00~13:30。
+    用分K支撐壓力計算，避免盤前盤後資料干擾。
+    """
+    if df_i is None or df_i.empty:
+        return df_i
+
+    start_t = datetime.strptime("09:00", "%H:%M").time()
+    end_t = datetime.strptime("13:30", "%H:%M").time()
+
+    try:
+        return df_i[
+            (df_i.index.time >= start_t) &
+            (df_i.index.time <= end_t)
+        ]
+    except Exception:
+        return df_i
+
+
+def calc_intraday_5m_30m_plan(code, market, kind, close, high20, low20, atr):
+    """
+    V5.8 職業級盤中價位算法：
+    - 進場價：用 5分K 支撐/壓力計算
+      當沖多/隔日沖：靠近 5分K 支撐承接
+      當沖空：跌破 5分K 支撐轉弱
+    - 停利價：用 5分K 壓力/支撐與 0.6R 交叉計算
+      做多：停利至少要有 0.6R 正報酬，且參考 5分K 壓力
+      做空：停利至少要有 0.6R 正報酬，且參考 5分K 支撐
+    - 停損價：用 30分K 支撐/壓力
+      做多：跌破30分K支撐停損
+      做空：站回30分K壓力停損
+
+    注意：
+    這是分K技術估算，實戰仍要看1分K轉折、量能與撮合速度。
+    """
+    t = tick_size(close)
+    df5 = get_yf_intraday(code, market, interval="5m", period="5d")
+    df30 = get_yf_intraday(code, market, interval="30m", period="10d")
+
+    df5 = _regular_session_only(df5)
+    df30 = _regular_session_only(df30)
+
+    if df5 is not None and not df5.empty:
+        # 近 36 根 5分K，大約近半天到一天的短線支撐壓力
+        recent5 = df5.tail(36)
+        support5 = float(recent5["Low"].min())
+        resistance5 = float(recent5["High"].max())
+        last5 = float(recent5["Close"].iloc[-1])
+    else:
+        support5 = float(low20)
+        resistance5 = float(high20)
+        last5 = float(close)
+
+    if df30 is not None and not df30.empty:
+        # 近 8 根 30分K，大約近 1~2 個交易日的關鍵支撐壓力
+        recent30 = df30.tail(8)
+        support30 = float(recent30["Low"].min())
+        resistance30 = float(recent30["High"].max())
+    else:
+        support30 = float(low20)
+        resistance30 = float(high20)
+
+    # 避免支撐/壓力過於貼近導致停損停利不合理
+    min_gap = max(float(atr) * 0.20, t * 3)
+
+    if kind == "intraday_short":
+        # 當沖空：跌破 5分K 支撐進場，站回 30分K 壓力停損
+        entry_raw = min(support5, last5)
+        entry = round_price_by_tick(entry_raw, "down")
+
+        stop_raw = max(resistance30, entry + min_gap)
+        stop = round_price_by_tick(stop_raw, "up")
+
+        risk = max(abs(stop - entry), min_gap)
+        target_by_r = entry - risk * 0.60
+        target_by_5m = support5 - max((resistance5 - support5) * 0.30, t * 2)
+        take_profit = round_price_by_tick(min(target_by_r, target_by_5m), "down")
+
+    else:
+        # 當沖多 / 隔日沖：靠 5分K 支撐承接，跌破 30分K 支撐停損
+        entry_raw = max(support5, support30)
+        # 若支撐價高於現價太多，改用現價附近的 5分K 支撐，避免追太高
+        if entry_raw > close:
+            entry_raw = min(support5, close)
+
+        entry = round_price_by_tick(entry_raw, "nearest")
+
+        stop_raw = min(support30, entry - min_gap)
+        stop = round_price_by_tick(stop_raw, "down")
+
+        risk = max(abs(entry - stop), min_gap)
+        target_by_r = entry + risk * 0.60
+        target_by_5m = resistance5
+        # 停利必須讓帳面至少 0.6R 為正，同時參考5分K壓力
+        take_profit = round_price_by_tick(max(target_by_r, target_by_5m), "up")
+
+    return {
+        "entry": entry,
+        "take_profit": take_profit,
+        "stop": stop,
+        "support5": support5,
+        "resistance5": resistance5,
+        "support30": support30,
+        "resistance30": resistance30,
+    }
 
 def calc_take_profit_by_60_percent(entry, stop, kind):
     """
@@ -1400,65 +1479,64 @@ def calc_take_profit_by_60_percent(entry, stop, kind):
     return round_price_by_tick(entry + reward, "up")
 
 
+
 def build_quantum_trade_plan(code, market, kind, close, high20, low20, atr):
     """
-    建議進場 / 停利 / 停損：
-    1. 優先使用前一交易日 12:30~13:30 支撐。
-    2. 停利用 0.6R 帳面正報酬邏輯。
-    3. 全部套台股 Tick 修正。
+    V5.8：
+    改用 5分K 支撐壓力計算進場與停利。
+    停損改用 30分K 支撐/壓力。
     """
-    levels = get_prev_1230_1330_levels(code, market)
-    t = tick_size(close)
-
-    if levels.get("ok"):
-        support = float(levels["support"])
-        resistance = float(levels["resistance"])
-        one_hour_range = max(resistance - support, t * 3)
-
-        if kind == "intraday_short":
-            # 當沖空：跌破前日12:30~13:30支撐才啟動偏空。
-            entry = round_price_by_tick(support, "down")
-            stop_raw = max(resistance, entry + max(one_hour_range * 0.60, atr * 0.25, t * 3))
-            stop = round_price_by_tick(stop_raw, "up")
-            take_profit = calc_take_profit_by_60_percent(entry, stop, kind)
-            basis = f"跌破前日{levels['date']} 12:30~13:30支撐"
-        else:
-            # 當沖多 / 隔日沖：以前日12:30~13:30支撐作建議承接價。
-            entry = round_price_by_tick(support, "nearest")
-            stop_raw = entry - max(one_hour_range * 0.60, atr * 0.25, t * 3)
-            stop = round_price_by_tick(stop_raw, "down")
-            take_profit = calc_take_profit_by_60_percent(entry, stop, kind)
-            basis = f"前日{levels['date']} 12:30~13:30支撐"
+    try:
+        plan = calc_intraday_5m_30m_plan(
+            code=code,
+            market=market,
+            kind=kind,
+            close=close,
+            high20=high20,
+            low20=low20,
+            atr=atr
+        )
 
         return {
-            "entry": entry,
-            "take_profit": take_profit,
-            "stop": stop,
-            "basis": basis,
-            "support_1230": support,
-            "resistance_1230": resistance,
+            "entry": plan["entry"],
+            "take_profit": plan["take_profit"],
+            "stop": plan["stop"],
+            "basis": "",
+            "support_1230": None,
+            "resistance_1230": None,
+            "support5": plan.get("support5"),
+            "resistance5": plan.get("resistance5"),
+            "support30": plan.get("support30"),
+            "resistance30": plan.get("resistance30"),
         }
 
-    # 沒有盤中資料時，用日K支撐備援
+    except Exception as e:
+        print(f"V5.8 分K交易計畫失敗 {code}: {e}", flush=True)
+
+    # 備援：若分K抓不到，至少回傳日K可用價位
+    t = tick_size(close)
     if kind == "intraday_short":
         entry = round_price_by_tick(min(low20, close), "down")
         stop = round_price_by_tick(entry + max(atr * 0.70, t * 3), "up")
         take_profit = calc_take_profit_by_60_percent(entry, stop, kind)
-        basis = "日K支撐備援，未取得前日12:30~13:30資料"
     else:
         entry = round_price_by_tick(max(low20, close - atr * 0.50), "nearest")
         stop = round_price_by_tick(entry - max(atr * 0.70, t * 3), "down")
         take_profit = calc_take_profit_by_60_percent(entry, stop, kind)
-        basis = "日K支撐備援，未取得前日12:30~13:30資料"
 
     return {
         "entry": entry,
         "take_profit": take_profit,
         "stop": stop,
-        "basis": basis,
+        "basis": "",
         "support_1230": None,
         "resistance_1230": None,
+        "support5": None,
+        "resistance5": None,
+        "support30": None,
+        "resistance30": None,
     }
+
 
 def score_quantum_candidate(df, kind, code=None, market=None):
     close_series = pd.to_numeric(df["Close"], errors="coerce")
@@ -1561,14 +1639,13 @@ def format_quantum_top_report(command, rows):
             f"   🏆 AI勝率 {r['win_rate']:.1f}%｜樣本 {r['samples']}｜分數 {r['score']:.1f}\n"
             f"   🎯 建議進場價：{fmt_price(r['entry'])}\n"
             f"   ✅ 建議停利價：{fmt_price(r['take_profit'])}\n"
-            f"   🛑 建議停損價：{fmt_price(r['stop'])}\n"
-            f"   📌 依據：{r['basis']}"
+            f"   🛑 建議停損價：{fmt_price(r['stop'])}"
         )
 
     lines.extend([
         "━━━━━━━━━━━━━━",
         "⚠️ 勝率為量價與歷史日K訊號估算，不保證獲利。",
-        "⚠️ 盤中請搭配即時量能、分K轉折與停損紀律。",
+        "⚠️ 盤中建議搭配1分K轉折確認，跌破30分K支撐務必停損。",
     ])
 
     text = "\n".join(lines)
@@ -1606,44 +1683,72 @@ def process_quantum_item(item, kind):
     }
 
 
+
+def _attach_one_trade_plan(r, kind):
+    try:
+        trade_plan = build_quantum_trade_plan(
+            code=r["code"],
+            market=r["market"],
+            kind=kind,
+            close=r["close"],
+            high20=r["high20"],
+            low20=r["low20"],
+            atr=r["atr"]
+        )
+        r["entry"] = trade_plan["entry"]
+        r["take_profit"] = trade_plan["take_profit"]
+        r["stop"] = trade_plan["stop"]
+        r["basis"] = ""
+        r["support5"] = trade_plan.get("support5")
+        r["resistance5"] = trade_plan.get("resistance5")
+        r["support30"] = trade_plan.get("support30")
+        r["resistance30"] = trade_plan.get("resistance30")
+
+    except Exception as e:
+        print(f"交易計畫計算失敗 {r.get('code')}: {e}", flush=True)
+        if kind == "intraday_short":
+            r["entry"] = round_price_by_tick(min(r["low20"], r["close"]), "down")
+            r["stop"] = round_price_by_tick(r["entry"] + max(r["atr"] * 0.70, tick_size(r["close"]) * 3), "up")
+        else:
+            r["entry"] = round_price_by_tick(max(r["low20"], r["close"] - r["atr"] * 0.50), "nearest")
+            r["stop"] = round_price_by_tick(r["entry"] - max(r["atr"] * 0.70, tick_size(r["close"]) * 3), "down")
+
+        r["take_profit"] = calc_take_profit_by_60_percent(r["entry"], r["stop"], kind)
+        r["basis"] = ""
+        r["support5"] = None
+        r["resistance5"] = None
+        r["support30"] = None
+        r["resistance30"] = None
+
+    return r
+
+
 def attach_trade_plan_to_top_rows(rows, kind):
     """
-    只對前5名計算前日 12:30~13:30 支撐與進停利損。
-    這是速度優化關鍵：不再對30檔全部抓5分K。
+    只對前5名計算分K價位，且改成並行處理。
+    速度會比一檔一檔慢慢抓快很多。
     """
     top_n = get_quantum_top_n()
+    top_rows = rows[:top_n]
+
+    if not top_rows:
+        return []
+
+    workers = min(5, max(1, len(top_rows)))
     final_rows = []
 
-    for r in rows[:top_n]:
-        try:
-            trade_plan = build_quantum_trade_plan(
-                code=r["code"],
-                market=r["market"],
-                kind=kind,
-                close=r["close"],
-                high20=r["high20"],
-                low20=r["low20"],
-                atr=r["atr"]
-            )
-            r["entry"] = trade_plan["entry"]
-            r["take_profit"] = trade_plan["take_profit"]
-            r["stop"] = trade_plan["stop"]
-            r["basis"] = trade_plan["basis"]
-        except Exception as e:
-            print(f"交易計畫計算失敗 {r.get('code')}: {e}", flush=True)
-            # 保障一定有數字，不回傳文字占位
-            if kind == "intraday_short":
-                r["entry"] = round_price_by_tick(min(r["low20"], r["close"]), "down")
-                r["stop"] = round_price_by_tick(r["entry"] + max(r["atr"] * 0.70, tick_size(r["close"]) * 3), "up")
-            else:
-                r["entry"] = round_price_by_tick(max(r["low20"], r["close"] - r["atr"] * 0.50), "nearest")
-                r["stop"] = round_price_by_tick(r["entry"] - max(r["atr"] * 0.70, tick_size(r["close"]) * 3), "down")
-            r["take_profit"] = calc_take_profit_by_60_percent(r["entry"], r["stop"], kind)
-            r["basis"] = "日K備援計算"
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_attach_one_trade_plan, dict(r), kind) for r in top_rows]
+        for fut in as_completed(futures):
+            try:
+                final_rows.append(fut.result())
+            except Exception as e:
+                print(f"TOP5分K計畫略過：{e}", flush=True)
 
-        final_rows.append(r)
-
+    # 並行完成順序不固定，重新依排名分數排序
+    final_rows = sorted(final_rows, key=lambda x: (x["rank_score"], x["win_rate"], x["score"]), reverse=True)
     return final_rows
+
 
 def run_quantum_scan(command):
     kind = QUANTUM_COMMANDS.get(command)
