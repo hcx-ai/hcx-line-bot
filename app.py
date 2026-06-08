@@ -27,9 +27,16 @@ import requests
 
 
 # ============================================================
+# HCX AI 股票分析師 LINE Bot
+# V5 HCX-AI量子雷達強化版
+# 重點：
+# 1. 參考HCX-AI量子雷達：先抓 TWSE / TPEx 官方全市場資料，代號與名稱一起建立快取
+# 2. 股票名稱不再只靠 yfinance，避免 2330 2330、1717 1717
+# 3. 加入主力成本估算、支撐壓力、台股 Tick 合法價位
+# 4. 加入做多 / 做空價位說明
+# ============================================================
 
-
-APP_VERSION = "V6.1 正式版"
+APP_VERSION = "V6.2 正式版｜量子雷達選股核心＋隱藏搜尋範圍"
 
 app = Flask(__name__)
 
@@ -672,7 +679,6 @@ def format_tick_profit_line(row):
     plan_ticks = calc_plan_profit_ticks(entry, take_profit, kind)
 
     msg = (
-        f"   💰 成本約 {info['cost']:.0f}元/張｜1 Tick約 {info['tick_profit']:.0f}元\n"
         f"   🔥 回本門檻：{info['break_even_ticks']} Tick｜建議停利約 {plan_ticks} Tick"
     )
     return msg
@@ -1874,20 +1880,95 @@ def _operability_score(row):
     return price_score * 0.20 + amp_score * 0.25 + vol_ratio_score * 0.25 + value_score * 0.20 + tick_score * 0.10
 
 
+
+def _radar_score_peak(value, good_low, good_high, weak_low, weak_high, default=50.0):
+    """
+    參考量子雷達隔日沖模型的 peak score：
+    分數高點落在合理區間，太弱或太過熱都降權。
+    """
+    try:
+        v = float(value)
+    except Exception:
+        return float(default)
+
+    if good_low <= v <= good_high:
+        return 100.0
+    if weak_low <= v < good_low:
+        return _clip_score((v - weak_low) / max(good_low - weak_low, 1e-9) * 100.0)
+    if good_high < v <= weak_high:
+        return _clip_score((weak_high - v) / max(weak_high - good_high, 1e-9) * 100.0)
+    return float(default)
+
+
+def _quantum_daily_swing_score(row, volume_score, value_score):
+    """
+    量子雷達隔日沖核心：
+    流動性 + 收盤位置 + 健康漲幅 + 振幅控制 + 均線 / 量比加權。
+    """
+    pct = float(row.get("pct") or 0)
+    pos20 = _clip_score(row.get("pos20", 50))
+    amplitude = abs(float(row.get("amplitude") or 0))
+    vol_ratio = float(row.get("vol_ratio") or 0)
+
+    liquidity = float(volume_score) * 0.52 + float(value_score) * 0.48
+    momentum = _radar_score_peak(pct, 1.2, 5.8, -0.5, 9.4, default=45.0)
+    amp_score = _radar_score_peak(amplitude, 1.2, 6.8, 0.1, 12.0, default=55.0)
+    volume_ratio_score = _radar_score_peak(vol_ratio, 1.20, 4.50, 0.55, 8.00, default=50.0)
+
+    close = float(row.get("close") or 0)
+    ma5 = float(row.get("ma5") or 0)
+    ma10 = float(row.get("ma10") or 0)
+    ma20 = float(row.get("ma20") or 0)
+
+    trend_checks = [
+        close > ma5 if ma5 > 0 else False,
+        close > ma10 if ma10 > 0 else False,
+        close > ma20 if ma20 > 0 else False,
+        ma5 >= ma10 if ma5 > 0 and ma10 > 0 else False,
+        ma10 >= ma20 if ma10 > 0 and ma20 > 0 else False,
+    ]
+    trend_score = sum(bool(x) for x in trend_checks) / max(len(trend_checks), 1) * 100.0
+
+    score = (
+        liquidity * 0.24 +
+        pos20 * 0.25 +
+        momentum * 0.24 +
+        amp_score * 0.11 +
+        volume_ratio_score * 0.08 +
+        trend_score * 0.08
+    )
+
+    # 風險扣分：不追過熱、不追弱收盤，貼近原量子雷達的風控精神。
+    if pct <= 0:
+        score -= 18
+    if pos20 < 55:
+        score -= 12
+    if pct >= 8.8:
+        score -= 14
+    if amplitude >= 9.5:
+        score -= 10
+
+    return round(_clip_score(score), 1)
+
+
+
 def apply_hcx_daily_radar_ranking(command, rows):
     """
-    依照使用者上傳的黑暗量子選股日報精神：
-    - 先做全體候選的量能/金額百分位
-    - 當沖多看多方分數
-    - 當沖空看空方分數
-    - 隔日沖看隔日沖分數
-    - 額外加入職業操盤可操作性，最後只取前5名
+    V6.2 正式版：
+    依照使用者上傳的量子雷達選股方式修正 LINE 指令選股。
+
+    原則：
+    - 當沖多：用「多方分數」排序。
+    - 當沖空：用「空方分數」排序。
+    - 隔日沖：用「隔日沖分數」排序。
+    - 當沖股：多空綜合後選最適合操作的前5名。
+    - 嚴格保留流動性過濾，避免低量股票進榜。
     """
     if not rows:
         return []
 
-    vols = [r.get("volume", 0) for r in rows]
-    vals = [r.get("value_m", 0) for r in rows]
+    vols = [float(r.get("volume_lots") or 0) for r in rows]
+    vals = [float(r.get("value_m") or 0) for r in rows]
     volume_scores = _percentile_list(vols)
     value_scores = _percentile_list(vals)
 
@@ -1903,219 +1984,117 @@ def apply_hcx_daily_radar_ranking(command, rows):
 
         pct = float(r.get("pct") or 0)
         pos20 = _clip_score(r.get("pos20", 50))
-        amplitude = float(r.get("amplitude") or 0)
+        amplitude = abs(float(r.get("amplitude") or 0))
         oper = _operability_score(r)
         win_rate = float(r.get("win_rate") or 50)
         samples = int(r.get("samples") or 0)
         sample_factor = min(samples / 12, 1.0)
 
+        # 完整對齊量子雷達 score_dataframe 的四大權重：
+        # 量能 0.28 + 金額 0.22 + 漲跌幅 0.30 + 收盤位置 0.20
         long_pct_score = _clip_score(max(pct, 0) / 10 * 100)
         short_pct_score = _clip_score(max(-pct, 0) / 10 * 100)
         long_pos_score = pos20
         short_pos_score = 100 - pos20
 
-        # 與黑暗量子雷達一致的四權重精神：量能、金額、漲跌幅、收盤位置。
-        long_score = volume_score * 0.28 + value_score * 0.22 + long_pct_score * 0.30 + long_pos_score * 0.20
-        short_score = volume_score * 0.28 + value_score * 0.22 + short_pct_score * 0.30 + short_pos_score * 0.20
+        long_score = (
+            float(volume_score) * 0.28 +
+            float(value_score) * 0.22 +
+            long_pct_score * 0.30 +
+            long_pos_score * 0.20
+        )
 
-        # 隔日沖用健康漲幅、量價、收盤位置、振幅平衡，避免只追最強漲幅。
-        momentum = _healthy_momentum_score(pct, "long")
-        if 1.2 <= amplitude <= 6.8:
-            amp_score = 100.0
-        elif amplitude < 1.2:
-            amp_score = _clip_score((amplitude - 0.1) / 1.1 * 100)
-        elif amplitude < 12.0:
-            amp_score = _clip_score((12.0 - amplitude) / 5.2 * 100)
-        else:
-            amp_score = 20.0
-        liquidity = volume_score * 0.52 + value_score * 0.48
-        swing_score = liquidity * 0.28 + pos20 * 0.30 + momentum * 0.28 + amp_score * 0.14
+        short_score = (
+            float(volume_score) * 0.28 +
+            float(value_score) * 0.22 +
+            short_pct_score * 0.30 +
+            short_pos_score * 0.20
+        )
 
-        # 職業當沖綜合分：原始選股分數為主，勝率/可操作性為輔。
-        pro_long = long_score * 0.48 + win_rate * (0.22 * sample_factor + 0.10 * (1 - sample_factor)) + oper * 0.30
-        pro_short = short_score * 0.48 + win_rate * (0.22 * sample_factor + 0.10 * (1 - sample_factor)) + oper * 0.30
-        pro_swing = swing_score * 0.52 + win_rate * (0.22 * sample_factor + 0.10 * (1 - sample_factor)) + oper * 0.26
+        swing_score = _quantum_daily_swing_score(r, volume_score, value_score)
+
+        # 職業操盤排序：原始分數為主，可操作性與回測只作輔助。
+        pro_long = long_score * 0.78 + oper * 0.14 + win_rate * (0.08 * sample_factor)
+        pro_short = short_score * 0.78 + oper * 0.14 + win_rate * (0.08 * sample_factor)
+        pro_swing = swing_score * 0.80 + oper * 0.10 + win_rate * (0.10 * sample_factor)
 
         rr = dict(r)
         rr["volume_score"] = volume_score
         rr["value_score"] = value_score
-        rr["long_score"] = long_score
-        rr["short_score"] = short_score
-        rr["swing_score"] = swing_score
-        rr["operability_score"] = oper
+        rr["long_score"] = round(long_score, 1)
+        rr["short_score"] = round(short_score, 1)
+        rr["swing_score"] = round(swing_score, 1)
+        rr["operability_score"] = round(oper, 1)
 
         if command == "當沖多":
-            rr["score"] = long_score
-            rr["rank_score"] = pro_long
+            rr["score"] = round(long_score, 1)
+            rr["rank_score"] = round(pro_long, 1)
             rr["trade_kind"] = "intraday_long"
             rr["signal"] = "🟥 偏多當沖"
-            keep = long_score >= 45 and pct > -8.8 and oper >= 45
+            # 參考量子雷達多方最低分 60，再加一點當沖實戰條件，避免弱收盤硬入榜。
+            keep = (
+                long_score >= 60 and
+                pct >= -1.5 and
+                pos20 >= 55 and
+                oper >= 45
+            )
+
         elif command == "當沖空":
-            rr["score"] = short_score
-            rr["rank_score"] = pro_short
+            rr["score"] = round(short_score, 1)
+            rr["rank_score"] = round(pro_short, 1)
             rr["trade_kind"] = "intraday_short"
             rr["signal"] = "🟩 偏空當沖"
-            keep = short_score >= 45 and pct < 8.8 and oper >= 45
+            keep = (
+                short_score >= 60 and
+                pct <= 1.5 and
+                pos20 <= 45 and
+                oper >= 45
+            )
+
         elif command == "隔日沖":
-            rr["score"] = swing_score
-            rr["rank_score"] = pro_swing
+            rr["score"] = round(swing_score, 1)
+            rr["rank_score"] = round(pro_swing, 1)
             rr["trade_kind"] = "swing"
-            rr["signal"] = "🟠 隔日沖觀察"
-            keep = swing_score >= 42 and pct > -6.5 and oper >= 40
-        else:
-            # 當沖股：多空都比，給當下最好操作方向。
-            if pro_short > pro_long:
-                rr["score"] = short_score
-                rr["rank_score"] = pro_short
-                rr["trade_kind"] = "intraday_short"
-                rr["signal"] = "🟩 偏空當沖"
-            else:
-                rr["score"] = long_score
-                rr["rank_score"] = pro_long
+            rr["signal"] = "🟧 隔日沖觀察"
+            keep = (
+                swing_score >= 62 and
+                pct >= -0.5 and
+                pos20 >= 55 and
+                oper >= 42
+            )
+
+        elif command == "當沖股":
+            if long_score >= short_score:
+                rr["score"] = round(long_score, 1)
+                rr["rank_score"] = round(pro_long, 1)
                 rr["trade_kind"] = "intraday_long"
                 rr["signal"] = "🟥 偏多當沖"
-            keep = max(long_score, short_score) >= 45 and oper >= 45
-
-        # 過熱/過冷保護：極端漲跌停附近不列為最好操作前五名。
-        if abs(pct) >= 9.75:
-            rr["rank_score"] -= 18
-        if amplitude >= 12:
-            rr["rank_score"] -= 10
+                keep = long_score >= 60 and pct >= -1.5 and pos20 >= 55 and oper >= 45
+            else:
+                rr["score"] = round(short_score, 1)
+                rr["rank_score"] = round(pro_short, 1)
+                rr["trade_kind"] = "intraday_short"
+                rr["signal"] = "🟩 偏空當沖"
+                keep = short_score >= 60 and pct <= 1.5 and pos20 <= 45 and oper >= 45
+        else:
+            keep = False
 
         if keep:
             ranked.append(rr)
 
-    ranked = sorted(ranked, key=lambda x: (x["rank_score"], x.get("win_rate", 0), x.get("value_m", 0)), reverse=True)
-    if not ranked:
-        ranked = sorted(rows, key=lambda x: (x.get("rank_score", 0), x.get("win_rate", 0)), reverse=True)
+    # 先照量子雷達原始分數排序，再用職業評分與流動性做同分排序。
+    ranked = sorted(
+        ranked,
+        key=lambda x: (
+            float(x.get("score") or 0),
+            float(x.get("rank_score") or 0),
+            float(x.get("value_m") or 0),
+            float(x.get("volume_lots") or 0),
+        ),
+        reverse=True
+    )
+
     return ranked[:get_quantum_deep_limit()]
-
-def format_quantum_top_report(command, rows):
-    title_map = {
-        "當沖多": "🔴 當沖多 TOP 5｜職業操盤精選",
-        "當沖空": "🟢 當沖空 TOP 5｜職業操盤精選",
-        "隔日沖": "🟠 隔日沖 TOP 5｜選股日報精選",
-        "當沖股": "⚡ 最佳當沖股 TOP 5｜多空綜合精選",
-    }
-
-    if not rows:
-        return f"""⚡ HCX-AI量子雷達
-🕒 查詢時間：{query_time_text()}
-📌 指令：{command}
-
-本次沒有符合條件的股票。
-可稍後盤中再查，或放寬掃描條件。
-"""
-
-    lines = [
-        "⚡ HCX-AI量子雷達",
-        f"🕒 查詢時間：{query_time_text()}",
-        f"{title_map.get(command, command)}",
-        f"📦 搜尋範圍：600檔 → 100 → 30 → TOP5｜最低量能 {get_quantum_min_volume_lots():,} 張",
-        "━━━━━━━━━━━━━━",
-    ]
-
-    for idx, r in enumerate(rows[:get_quantum_top_n()], 1):
-        direction = r.get("signal", "職業當沖觀察")
-        lines.append(
-            f"{idx}. {r['code']} {r['name']}｜{direction}\n"
-            f"   收盤 {fmt_price(r['close'])}｜漲跌 {r['pct']:+.2f}%｜成交量 {fmt_lots(r.get('volume_lots'))}張｜量比 {r['vol_ratio']:.2f}\n"
-            f"   🏆 AI勝率 {r['win_rate']:.1f}%｜樣本 {r['samples']}｜職業評分 {r['rank_score']:.1f}\n"
-            f"   🎯 建議進場價：{fmt_price(r['entry'])}\n"
-            f"   ✅ 建議停利價：{fmt_price(r['take_profit'])}\n"
-            f"   🛑 建議停損價：{fmt_price(r['stop'])}\n"
-            f"{format_tick_profit_line(r)}"
-        )
-
-    lines.extend([
-        "━━━━━━━━━━━━━━",
-        "⚠️ 此為HCX-AI量子雷達篩選結果，不保證獲利。",
-        "⚠️ 當沖實戰請搭配1分K轉折、量能與停損紀律。",
-    ])
-
-    text = "\n".join(lines)
-    return text[:4800]
-
-def get_quantum_workers():
-    """Render 免費機不要開太大，避免被 yfinance 擋或 CPU 爆掉。"""
-    try:
-        n = int(os.environ.get("QUANTUM_WORKERS", "8"))
-        return max(3, min(n, 10))
-    except Exception:
-        return 8
-
-
-def process_quantum_item(item, kind):
-    """單檔日K整理，供 ThreadPoolExecutor 並行使用。"""
-    code = item["code"]
-    meta = get_stock_meta(code)
-    df, source = get_stock_data(code, meta["market"])
-
-    if df is None or df.empty or len(df) < 80:
-        return None
-
-    metrics = score_quantum_candidate(df, kind, code=code, market=meta["market"])
-
-    # V6.1 基本流動性保護：避免冷門股進入當沖前五名
-    official_lots = float(item.get("volume_lots") or 0)
-    official_value_m = float(item.get("official_value_m") or 0)
-    metrics["volume_lots"] = max(float(metrics.get("volume_lots") or 0), official_lots)
-    metrics["value_m"] = max(float(metrics.get("value_m") or 0), official_value_m)
-
-    if metrics.get("close", 0) < 5:
-        return None
-    if metrics.get("volume_lots", 0) < get_quantum_min_volume_lots():
-        return None
-    if metrics.get("value_m", 0) < get_quantum_min_value_m():
-        return None
-
-    return {
-        "code": code,
-        "name": meta["name"],
-        "market": meta["market"],
-        **metrics,
-    }
-
-
-def _attach_one_trade_plan(r, kind):
-    try:
-        trade_plan = build_quantum_trade_plan(
-            code=r["code"],
-            market=r["market"],
-            kind=r.get("trade_kind", kind),
-            close=r["close"],
-            high20=r["high20"],
-            low20=r["low20"],
-            atr=r["atr"]
-        )
-        r["entry"] = trade_plan["entry"]
-        r["take_profit"] = trade_plan["take_profit"]
-        r["stop"] = trade_plan["stop"]
-        r["basis"] = ""
-        r["support5"] = trade_plan.get("support5")
-        r["resistance5"] = trade_plan.get("resistance5")
-        r["support30"] = trade_plan.get("support30")
-        r["resistance30"] = trade_plan.get("resistance30")
-
-    except Exception as e:
-        print(f"交易計畫計算失敗 {r.get('code')}: {e}", flush=True)
-        actual_kind = r.get("trade_kind", kind)
-        if actual_kind == "intraday_short":
-            r["entry"] = round_price_by_tick(min(r["low20"], r["close"]), "down")
-            r["stop"] = round_price_by_tick(r["entry"] + max(r["atr"] * 0.70, tick_size(r["close"]) * 3), "up")
-        else:
-            r["entry"] = round_price_by_tick(max(r["low20"], r["close"] - r["atr"] * 0.50), "nearest")
-            r["stop"] = round_price_by_tick(r["entry"] - max(r["atr"] * 0.70, tick_size(r["close"]) * 3), "down")
-
-        r["take_profit"] = calc_take_profit_by_60_percent(r["entry"], r["stop"], actual_kind)
-        r["basis"] = ""
-        r["support5"] = None
-        r["resistance5"] = None
-        r["support30"] = None
-        r["resistance30"] = None
-
-    return r
-
 
 def attach_trade_plan_to_top_rows(rows, kind):
     """
@@ -2207,8 +2186,6 @@ def start_quantum_scan(user_id, command):
 系統正在啟動HCX-AI量子雷達600檔篩選中...
 
 📊 掃描模式：選股日報核心 TOP 5
-📦 搜尋範圍：600檔 → 100 → 30 → TOP5
-📦 最低量能門檻：5,000張
 🕒 查詢時間：{query_time_text()}
 
 稍後會自動推播結果給你。
