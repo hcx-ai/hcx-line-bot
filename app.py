@@ -32,7 +32,7 @@ import requests
 # 4. 加入做多 / 做空價位說明
 # ============================================================
 
-APP_VERSION = "V5 黑暗量子雷達強化版｜官方名稱快取＋主力成本＋Tick多空價位"
+APP_VERSION = "V5.1 黑暗量子雷達強化版｜隱藏資料來源＋官方名稱快取＋主力成本"
 
 app = Flask(__name__)
 
@@ -688,8 +688,6 @@ def stock_ai(code):
 
 🏷️ 股票：{code} {stock_name}
 🏛️ 市場：{market}
-📡 資料來源：{used_source}
-
 ━━━━━━━━━━━━━━
 {price_icon}【即時價格雷達】
 💰 現價：{fmt_price(close)}
