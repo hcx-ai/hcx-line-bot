@@ -15,6 +15,7 @@ import re
 import math
 import time
 import traceback
+from datetime import datetime, timezone, timedelta
 from io import StringIO
 
 import pandas as pd
@@ -32,7 +33,7 @@ import requests
 # 4. 加入做多 / 做空價位說明
 # ============================================================
 
-APP_VERSION = "V5.1 黑暗量子雷達強化版｜隱藏資料來源＋官方名稱快取＋主力成本"
+APP_VERSION = "V5.3.1 黑暗量子雷達強化版｜只顯示查詢時間＋職業級成本雷達"
 
 app = Flask(__name__)
 
@@ -522,6 +523,137 @@ def fmt_pct(x):
         return "-"
 
 
+def data_date_text(df):
+    """
+    顯示最後一根日K的日期，也就是本次分析採用的資料日。
+    """
+    try:
+        last_date = df.index[-1]
+        if hasattr(last_date, "tz_localize"):
+            # yfinance 多半是無時區日期；這裡只取日期即可
+            pass
+        return pd.Timestamp(last_date).strftime("%Y-%m-%d")
+    except Exception:
+        return pd.Timestamp.today().strftime("%Y-%m-%d")
+
+
+def query_time_text():
+    """
+    顯示台灣查詢時間，精準到秒。
+    注意：這是使用者查詢當下時間；資料日仍以最後一根日K日期為準。
+    """
+    taiwan_tz = timezone(timedelta(hours=8))
+    return datetime.now(taiwan_tz).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def calc_vwap(typical_price, volume, days):
+    """
+    VWAP 成本：用典型價 (High+Low+Close)/3 搭配成交量計算。
+    比單純用收盤價更接近真實成交重心。
+    """
+    tp = typical_price.tail(days)
+    vol = volume.tail(days)
+
+    total_vol = float(vol.sum())
+    if total_vol <= 0:
+        return float(tp.mean())
+
+    return float((tp * vol).sum() / total_vol)
+
+
+def calc_volume_cluster_cost(typical_price, volume, days=60):
+    """
+    大量成交成本：
+    取近 days 日中成交量最大的前 30% K棒，計算其 VWAP。
+    用來估計籌碼密集區，不等於真實主力持股成本。
+    """
+    tp = typical_price.tail(days)
+    vol = volume.tail(days)
+
+    if len(tp) < 10 or float(vol.sum()) <= 0:
+        return float(tp.mean())
+
+    temp = pd.DataFrame({"tp": tp, "vol": vol}).dropna()
+    if temp.empty:
+        return float(tp.mean())
+
+    top_n = max(5, int(len(temp) * 0.30))
+    heavy = temp.sort_values("vol", ascending=False).head(top_n)
+    total_vol = float(heavy["vol"].sum())
+
+    if total_vol <= 0:
+        return float(heavy["tp"].mean())
+
+    return float((heavy["tp"] * heavy["vol"]).sum() / total_vol)
+
+
+def calc_professional_main_cost(close, high_series, low_series, close_series, volume_series):
+    """
+    職業級成本雷達：
+    舊版只用 20日VWAP，遇到急跌股會讓成本看起來過高。
+    新版改為：
+    1. 5日VWAP：短線控盤成本
+    2. 10日VWAP：短波段成本
+    3. 20日VWAP：波段籌碼成本
+    4. 60日大量成交成本：大量籌碼密集區
+    5. AI採用成本：依目前價格相對位置動態加權
+
+    注意：這仍是籌碼成本估算，不是券商實際買進成本。
+    """
+    typical_price = (high_series + low_series + close_series) / 3
+
+    cost5 = calc_vwap(typical_price, volume_series, 5)
+    cost10 = calc_vwap(typical_price, volume_series, 10)
+    cost20 = calc_vwap(typical_price, volume_series, 20)
+    cluster60 = calc_volume_cluster_cost(typical_price, volume_series, 60)
+
+    ma20 = float(close_series.rolling(20).mean().iloc[-1])
+    close = float(close)
+
+    # 急跌且跌破20日成本時，主控成本改偏重短線VWAP，避免估得太高。
+    if close < cost20 and close < ma20:
+        active_cost = cost5 * 0.55 + cost10 * 0.30 + cost20 * 0.15
+        cost_mode = "急跌修正版：偏重5日與10日短線成交重心"
+    # 強勢股站上20日成本時，加入大量成交成本，觀察主力鎖碼區。
+    elif close > cost20:
+        active_cost = cost5 * 0.30 + cost10 * 0.25 + cost20 * 0.25 + cluster60 * 0.20
+        cost_mode = "強勢追蹤版：加入大量成交籌碼區"
+    else:
+        active_cost = cost5 * 0.40 + cost10 * 0.35 + cost20 * 0.25
+        cost_mode = "標準波段版：5/10/20日VWAP加權"
+
+    cost_low = min(cost5, cost10, cost20, active_cost)
+    cost_high = max(cost5, cost10, cost20, active_cost)
+
+    diff = close - active_cost
+    pct = diff / active_cost * 100 if active_cost else 0
+
+    if close > active_cost:
+        light = "🟢"
+        status = "現價站上AI主控成本，短線籌碼相對有撐。"
+    elif close < active_cost:
+        light = "🔴"
+        status = "現價低於AI主控成本，代表上方仍有套牢與賣壓。"
+    else:
+        light = "🟡"
+        status = "現價接近AI主控成本，等待方向表態。"
+
+    return {
+        "cost5": cost5,
+        "cost10": cost10,
+        "cost20": cost20,
+        "cluster60": cluster60,
+        "active_cost": active_cost,
+        "cost_low": cost_low,
+        "cost_high": cost_high,
+        "diff": diff,
+        "pct": pct,
+        "light": light,
+        "status": status,
+        "mode": cost_mode,
+    }
+
+
 def stock_ai(code):
     try:
         code = str(code).strip()
@@ -546,6 +678,9 @@ def stock_ai(code):
 
 請稍後再試，或換其他代號測試。
 """
+
+        query_data_date = data_date_text(df)
+        query_time = query_time_text()
 
         close_series = pd.to_numeric(df["Close"], errors="coerce")
         high_series = pd.to_numeric(df["High"], errors="coerce")
@@ -573,26 +708,19 @@ def stock_ai(code):
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         atr14 = float(tr.rolling(14).mean().iloc[-1])
 
-        volume20 = volume_series.tail(20)
-        price20 = close_series.tail(20)
-        total_volume20 = float(volume20.sum())
-        if total_volume20 > 0:
-            main_cost = float((price20 * volume20).sum() / total_volume20)
-        else:
-            main_cost = ma20
+        cost_info = calc_professional_main_cost(
+            close=close,
+            high_series=high_series,
+            low_series=low_series,
+            close_series=close_series,
+            volume_series=volume_series
+        )
 
-        main_cost_diff = close - main_cost
-        main_cost_pct = main_cost_diff / main_cost * 100 if main_cost else 0
-
-        if close > main_cost:
-            chip_light = "🟢"
-            chip_status = "股價站在估算主力成本上方，籌碼相對偏強。"
-        elif close < main_cost:
-            chip_light = "🔴"
-            chip_status = "股價跌到估算主力成本下方，短線需留意賣壓。"
-        else:
-            chip_light = "🟡"
-            chip_status = "股價貼近估算主力成本，等待方向表態。"
+        main_cost = cost_info["active_cost"]
+        main_cost_diff = cost_info["diff"]
+        main_cost_pct = cost_info["pct"]
+        chip_light = cost_info["light"]
+        chip_status = cost_info["status"]
 
         if close > ma20 > ma60:
             trend = "偏多"
@@ -688,6 +816,7 @@ def stock_ai(code):
 
 🏷️ 股票：{code} {stock_name}
 🏛️ 市場：{market}
+🕒 查詢時間：{query_time}
 ━━━━━━━━━━━━━━
 {price_icon}【即時價格雷達】
 💰 現價：{fmt_price(close)}
@@ -702,9 +831,14 @@ def stock_ai(code):
 🌊 ATR14：{fmt_price(atr14)}
 
 ━━━━━━━━━━━━━━
-{chip_light}【主力成本估算】
-🏦 主力成本：{fmt_price(main_cost)}
-📏 成本乖離：{fmt_price(main_cost_diff)} / {fmt_pct(main_cost_pct)}
+{chip_light}【職業級成本雷達】
+🏦 AI主控成本：{fmt_price(main_cost)}
+📦 成本區間：{fmt_price(cost_info["cost_low"])} ~ {fmt_price(cost_info["cost_high"])}
+⚡ 5日短線VWAP：{fmt_price(cost_info["cost5"])}
+🌙 20日波段VWAP：{fmt_price(cost_info["cost20"])}
+🔥 60日大量成本：{fmt_price(cost_info["cluster60"])}
+📏 現價距主控成本：{fmt_price(main_cost_diff)} / {fmt_pct(main_cost_pct)}
+🧠 算法模式：{cost_info["mode"]}
 🧩 籌碼判斷：{chip_status}
 
 ━━━━━━━━━━━━━━
@@ -734,7 +868,7 @@ def stock_ai(code):
 ━━━━━━━━━━━━━━
 ⚠️ 風險提醒
 本訊息為程式估算與技術分析，不代表保證獲利。
-主力成本為近20日成交量加權均價估算，非券商實際持股成本。
+主力成本為5/10/20日VWAP與大量成交區加權估算，非券商實際持股成本。
 """
 
     except Exception as e:
