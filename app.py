@@ -25,9 +25,13 @@ import pandas as pd
 import yfinance as yf
 import requests
 
-# ============================================================
 
-APP_VERSION = "V6.1.1 正式版"
+# ============================================================
+# HCX AI 股票分析師 LINE Bot
+# V5 HCX-AI量子雷達強化版
+
+
+APP_VERSION = "V6.1 正式版"
 
 app = Flask(__name__)
 
@@ -670,6 +674,7 @@ def format_tick_profit_line(row):
     plan_ticks = calc_plan_profit_ticks(entry, take_profit, kind)
 
     msg = (
+        f"   💰 成本約 {info['cost']:.0f}元/張｜1 Tick約 {info['tick_profit']:.0f}元\n"
         f"   🔥 回本門檻：{info['break_even_ticks']} Tick｜建議停利約 {plan_ticks} Tick"
     )
     return msg
