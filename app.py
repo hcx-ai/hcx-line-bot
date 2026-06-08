@@ -9,6 +9,7 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
+
 import os
 import re
 import traceback
@@ -18,91 +19,85 @@ import pandas as pd
 import yfinance as yf
 import requests
 
+
+# ============================================================
+# HCX AI 股票分析師 LINE Bot
+# V3 華麗版：多元查詢 + 股票名稱 + 主力成本 + 進出場點位
+# ============================================================
+
+APP_VERSION = "V3 華麗版｜股票名稱＋主力成本＋進出場點位"
+
 app = Flask(__name__)
 
 configuration = Configuration(access_token=os.environ["LINE_CHANNEL_ACCESS_TOKEN"])
 handler = WebhookHandler(os.environ["LINE_CHANNEL_SECRET"])
 
 
-# 常用股票名稱備援表：避免官方來源臨時失效時完全抓不到名稱
+# ------------------------------------------------------------
+# 股票名稱備援表
+# 重點：1717 長興直接放在第一層，避免外部資料源失效時顯示 1717 1717
+# ------------------------------------------------------------
 FALLBACK_STOCK_NAMES = {
-    "2330": "台積電",
-    "2454": "聯發科",
-    "2317": "鴻海",
-    "1717": "長興",
-    "9105": "泰金寶-DR",
-    "2303": "聯電",
+    "1101": "台泥",
+    "1102": "亞泥",
+    "1216": "統一",
+    "1301": "台塑",
     "1303": "南亞",
+    "1326": "台化",
+    "1402": "遠東新",
+    "1476": "儒鴻",
+    "1605": "華新",
+    "1717": "長興",
     "2002": "中鋼",
+    "2207": "和泰車",
+    "2301": "光寶科",
+    "2303": "聯電",
+    "2308": "台達電",
+    "2317": "鴻海",
+    "2327": "國巨",
+    "2330": "台積電",
+    "2345": "智邦",
+    "2357": "華碩",
+    "2379": "瑞昱",
+    "2382": "廣達",
+    "2408": "南亞科",
+    "2409": "友達",
+    "2412": "中華電",
+    "2454": "聯發科",
     "2603": "長榮",
     "2609": "陽明",
     "2615": "萬海",
-    "2409": "友達",
-    "3481": "群創",
-    "2357": "華碩",
-    "2382": "廣達",
-    "3231": "緯創",
-    "4938": "和碩",
-    "2308": "台達電",
-    "2412": "中華電",
     "2881": "富邦金",
     "2882": "國泰金",
     "2884": "玉山金",
+    "2885": "元大金",
+    "2886": "兆豐金",
     "2891": "中信金",
     "2892": "第一金",
+    "3008": "大立光",
+    "3034": "聯詠",
+    "3231": "緯創",
+    "3443": "創意",
+    "3481": "群創",
+    "3661": "世芯-KY",
+    "3711": "日月光投控",
+    "4938": "和碩",
+    "5880": "合庫金",
+    "6505": "台塑化",
+    "6669": "緯穎",
+    "8046": "南電",
+    "8069": "元太",
+    "8299": "群聯",
+    "9105": "泰金寶-DR",
 }
 
 
-def clean_stock_name_text(text):
-    text = str(text).strip()
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
-def get_stock_name_from_isin(code, mode):
-    """
-    從 TWSE ISIN 公開資料抓股票名稱。
-    mode=2 上市，mode=4 上櫃。
-    """
-    try:
-        url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
-        r = requests.get(url, headers=headers, timeout=10)
-        r.encoding = "big5"
-
-        tables = pd.read_html(StringIO(r.text))
-        if not tables:
-            return None
-
-        df = tables[0]
-
-        # 通常第一欄是「有價證券代號及名稱」
-        first_col = df.columns[0]
-
-        for value in df[first_col].astype(str):
-            value = clean_stock_name_text(value)
-
-            # 例：1717　長興
-            if value.startswith(code):
-                # 移除代號後取名稱
-                name = value.replace(code, "", 1).strip()
-                name = re.split(r"\s+", name)[0].strip()
-
-                if name and name not in ["nan", "有價證券代號及名稱"]:
-                    return name
-
-    except Exception:
-        return None
-
-    return None
+def clean_text(x):
+    return re.sub(r"\s+", " ", str(x).strip())
 
 
 def get_stock_name_from_openapi(code):
-    """
-    從 TWSE/TPEx OpenAPI 抓股票名稱。
-    """
+    """TWSE / TPEx OpenAPI 名稱查詢。"""
     urls = [
         "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
         "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
@@ -116,22 +111,21 @@ def get_stock_name_from_openapi(code):
 
             data = r.json()
             for item in data:
-                sid = str(
+                sid = clean_text(
                     item.get("公司代號")
                     or item.get("股票代號")
                     or item.get("有價證券代號")
                     or ""
-                ).strip()
-
-                name = str(
+                )
+                name = clean_text(
                     item.get("公司簡稱")
                     or item.get("公司名稱")
                     or item.get("股票名稱")
                     or item.get("有價證券名稱")
                     or ""
-                ).strip()
+                )
 
-                if sid == code and name:
+                if sid == code and name and name.lower() != "nan":
                     return name
 
         except Exception:
@@ -140,10 +134,42 @@ def get_stock_name_from_openapi(code):
     return None
 
 
+def get_stock_name_from_isin(code, mode):
+    """
+    TWSE ISIN 名稱查詢。
+    mode=2 上市，mode=4 上櫃。
+    """
+    try:
+        url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=10)
+        r.encoding = "big5"
+
+        tables = pd.read_html(StringIO(r.text))
+        if not tables:
+            return None
+
+        df = tables[0]
+        first_col = df.columns[0]
+
+        for value in df[first_col].astype(str):
+            value = clean_text(value)
+
+            if value.startswith(code):
+                name = value.replace(code, "", 1).strip()
+                name = re.split(r"\s+", name)[0].strip()
+
+                if name and name.lower() != "nan" and "有價證券" not in name:
+                    return name
+
+    except Exception:
+        return None
+
+    return None
+
+
 def get_stock_name_from_yfinance(code):
-    """
-    yfinance 名稱備援，可能是英文名稱。
-    """
+    """yfinance 英文名稱備援。"""
     symbols = [f"{code}.TW", f"{code}.TWO", code]
 
     for symbol in symbols:
@@ -152,7 +178,7 @@ def get_stock_name_from_yfinance(code):
             info = ticker.get_info()
             name = info.get("shortName") or info.get("longName")
             if name:
-                return str(name).strip()
+                return clean_text(name)
         except Exception:
             continue
 
@@ -161,13 +187,19 @@ def get_stock_name_from_yfinance(code):
 
 def get_stock_name(code):
     """
-    股票名稱多來源查詢順序：
-    1. 內建常用備援表
-    2. TWSE OpenAPI / TPEx OpenAPI
-    3. TWSE ISIN 上市 / 上櫃
-    4. yfinance 名稱
-    5. 最後回傳代號
+    股票名稱查詢順序：
+    1. 內建備援表
+    2. TWSE/TPEx OpenAPI
+    3. TWSE ISIN 上市/上櫃
+    4. yfinance
+    5. 代號
     """
+    code = str(code).strip()
+
+    # 這段是保險，避免 1717 再次顯示成 1717 1717
+    if code == "1717":
+        return "長興"
+
     if code in FALLBACK_STOCK_NAMES:
         return FALLBACK_STOCK_NAMES[code]
 
@@ -191,11 +223,8 @@ def get_stock_name(code):
 
 
 def normalize_yfinance_df(df):
-    """
-    yfinance 有時會回傳 MultiIndex 欄位，這裡統一整理成 Open/High/Low/Close/Volume。
-    """
     if df is None or df.empty:
-        return df
+        return None
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
@@ -205,14 +234,15 @@ def normalize_yfinance_df(df):
         if col not in df.columns:
             return None
 
-    return df[needed].copy()
+    df = df[needed].copy()
+    for col in needed:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna()
+    return df
 
 
 def download_from_yfinance(code):
-    """
-    Yahoo Finance 多格式查詢：
-    上市 .TW、上櫃 .TWO、純代號。
-    """
     symbols = [f"{code}.TW", f"{code}.TWO", code]
 
     for symbol in symbols:
@@ -238,9 +268,7 @@ def download_from_yfinance(code):
 
 
 def download_from_twse(code):
-    """
-    TWSE 備援：上市股票日收盤資料。
-    """
+    """TWSE 上市日線備援。"""
     try:
         today = pd.Timestamp.today()
         dfs = []
@@ -267,8 +295,7 @@ def download_from_twse(code):
             if not rows:
                 continue
 
-            temp = pd.DataFrame(rows, columns=fields)
-            dfs.append(temp)
+            dfs.append(pd.DataFrame(rows, columns=fields))
 
         if not dfs:
             return None, None
@@ -306,9 +333,7 @@ def download_from_twse(code):
 
 
 def download_from_tpex(code):
-    """
-    TPEx 備援：上櫃股票日收盤資料。
-    """
+    """TPEx 上櫃日線備援。"""
     try:
         today = pd.Timestamp.today()
         dfs = []
@@ -374,12 +399,6 @@ def download_from_tpex(code):
 
 
 def get_stock_data(code):
-    """
-    多元查詢順序：
-    1. yfinance 上市 / 上櫃 / 純代號
-    2. TWSE 上市備援
-    3. TPEx 上櫃備援
-    """
     df, source = download_from_yfinance(code)
     if df is not None:
         return df, source
@@ -402,18 +421,38 @@ def series_float(series, idx=-1):
     return float(value)
 
 
+def fmt_price(x):
+    try:
+        return f"{float(x):.2f}"
+    except Exception:
+        return "-"
+
+
 def stock_ai(code):
     try:
+        code = str(code).strip()
         stock_name = get_stock_name(code)
         df, used_source = get_stock_data(code)
 
         if df is None or df.empty or len(df) < 60:
-            return f"查不到 {code} {stock_name} 的股票資料，請確認代號，或稍後再試。"
+            return f"""⚠️ HCX AI 查詢提醒
+
+股票：{code} {stock_name}
+
+目前查不到足夠日K資料。
+可能原因：
+① Yahoo Finance 暫時沒有回應
+② TWSE/TPEx 資料源維護中
+③ 股票代號輸入錯誤
+④ 該商品資料不足 60 根K棒
+
+請稍後再試，或換其他代號測試。
+"""
 
         close_series = pd.to_numeric(df["Close"], errors="coerce")
         high_series = pd.to_numeric(df["High"], errors="coerce")
         low_series = pd.to_numeric(df["Low"], errors="coerce")
-        volume_series_all = pd.to_numeric(df["Volume"], errors="coerce") if "Volume" in df.columns else None
+        volume_series = pd.to_numeric(df["Volume"], errors="coerce")
 
         close = series_float(close_series, -1)
         prev = series_float(close_series, -2)
@@ -427,10 +466,8 @@ def stock_ai(code):
         high20 = float(high_series.tail(20).max())
         low20 = float(low_series.tail(20).min())
         recent_high = float(high_series.tail(10).max())
+        recent_low = float(low_series.tail(10).min())
 
-        trend = "偏多" if close > ma20 > ma60 else "偏空" if close < ma20 < ma60 else "震盪"
-
-        # ATR 風控
         prev_close = close_series.shift(1)
         tr1 = high_series - low_series
         tr2 = (high_series - prev_close).abs()
@@ -439,14 +476,12 @@ def stock_ai(code):
         atr14 = float(tr.rolling(14).mean().iloc[-1])
 
         # 主力成本估算：近20日成交量加權均價 VWAP
-        if volume_series_all is not None:
-            volume20 = volume_series_all.tail(20)
-            price20 = close_series.tail(20)
-            total_volume = float(volume20.sum())
-            if total_volume > 0:
-                main_cost = float((price20 * volume20).sum() / total_volume)
-            else:
-                main_cost = ma20
+        volume20 = volume_series.tail(20)
+        price20 = close_series.tail(20)
+        total_volume20 = float(volume20.sum())
+
+        if total_volume20 > 0:
+            main_cost = float((price20 * volume20).sum() / total_volume20)
         else:
             main_cost = ma20
 
@@ -454,11 +489,27 @@ def stock_ai(code):
         main_cost_pct = main_cost_diff / main_cost * 100 if main_cost else 0
 
         if close > main_cost:
-            main_cost_status = "股價在估算主力成本上方，籌碼相對有撐。"
+            chip_light = "🟢"
+            chip_status = "股價站在主力成本上方，籌碼相對偏強。"
         elif close < main_cost:
-            main_cost_status = "股價在估算主力成本下方，短線需留意賣壓。"
+            chip_light = "🔴"
+            chip_status = "股價跌到主力成本下方，短線賣壓需要留意。"
         else:
-            main_cost_status = "股價接近估算主力成本，短線觀察方向。"
+            chip_light = "🟡"
+            chip_status = "股價貼近主力成本，等待方向表態。"
+
+        if close > ma20 > ma60:
+            trend = "偏多"
+            trend_icon = "🟢🚀"
+            advice = "均線呈現多方排列，短線偏多。可觀察突破壓力或回測 MA20 不破。"
+        elif close < ma20 < ma60:
+            trend = "偏空"
+            trend_icon = "🔴⚠️"
+            advice = "均線呈現空方排列，短線偏弱。保守者可先觀望，避免亂接刀。"
+        else:
+            trend = "震盪"
+            trend_icon = "🟡🔄"
+            advice = "均線糾結，屬於震盪整理。等待突破壓力或跌破支撐後再決定方向。"
 
         # 進出場點位
         breakout_buy = max(high20, close)
@@ -466,76 +517,99 @@ def stock_ai(code):
         breakout_target1 = breakout_buy + atr14 * 2.0
         breakout_target2 = breakout_buy + atr14 * 3.0
 
-        pullback_buy_low = max(low20, ma20 - atr14 * 0.5)
-        pullback_buy_high = ma20 + atr14 * 0.3
-        pullback_stop = pullback_buy_low - atr14 * 1.2
+        pullback_low = max(low20, ma20 - atr14 * 0.5)
+        pullback_high = ma20 + atr14 * 0.3
+        pullback_stop = pullback_low - atr14 * 1.2
         pullback_target = recent_high
 
-        short_trigger = min(low20, close)
-        short_stop = short_trigger + atr14 * 1.5
-        short_target = short_trigger - atr14 * 2.0
+        weak_trigger = min(low20, close)
+        weak_stop = weak_trigger + atr14 * 1.5
+        weak_target = weak_trigger - atr14 * 2.0
 
         if trend == "偏多":
-            advice = "站上月線與季線，短線偏多。可優先觀察突破買進，或回測 MA20 不破後承接。"
-            main_plan = f"""🚀 偏多進場規劃
-突破買進：{breakout_buy:.2f}
-停損：{breakout_stop:.2f}
-第一目標：{breakout_target1:.2f}
-第二目標：{breakout_target2:.2f}
+            plan = f"""🚀【多方攻擊計畫】
+✅ 突破買點：{fmt_price(breakout_buy)}
+🛡️ 防守停損：{fmt_price(breakout_stop)}
+🎯 第一目標：{fmt_price(breakout_target1)}
+🏆 第二目標：{fmt_price(breakout_target2)}
 
-🛡️ 回測承接
-買進區間：{pullback_buy_low:.2f} ~ {pullback_buy_high:.2f}
-停損：{pullback_stop:.2f}
-目標：{pullback_target:.2f}"""
+🛡️【回測承接計畫】
+📌 低接區間：{fmt_price(pullback_low)} ~ {fmt_price(pullback_high)}
+🚨 跌破停損：{fmt_price(pullback_stop)}
+🎯 反彈目標：{fmt_price(pullback_target)}"""
         elif trend == "偏空":
-            advice = "跌破均線結構，短線偏弱。偏保守者先觀望，若要操作以反彈不過壓力或跌破支撐為主。"
-            main_plan = f"""📉 偏空觀察規劃
-跌破支撐：{short_trigger:.2f}
-空方停損：{short_stop:.2f}
-空方目標：{short_target:.2f}
+            plan = f"""📉【偏空防守計畫】
+⚠️ 跌破支撐：{fmt_price(weak_trigger)}
+🛡️ 空方停損：{fmt_price(weak_stop)}
+🎯 空方目標：{fmt_price(weak_target)}
 
-⚠️ 若站回 MA20：{ma20:.2f}
-偏空看法要降低。"""
+🔁【轉強觀察】
+若重新站回 MA20：{fmt_price(ma20)}
+偏空看法要降低，避免追空。"""
         else:
-            advice = "目前均線糾結，屬於震盪盤。建議等突破壓力或跌破支撐再決定方向。"
-            main_plan = f"""🔄 震盪區間規劃
-區間壓力：{high20:.2f}
-區間支撐：{low20:.2f}
+            plan = f"""🔄【震盪盤操作計畫】
+📍 區間壓力：{fmt_price(high20)}
+📍 區間支撐：{fmt_price(low20)}
 
-突破壓力轉強：{high20:.2f}
-跌破支撐轉弱：{low20:.2f}
+🚀 突破壓力轉強：{fmt_price(high20)}
+⚠️ 跌破支撐轉弱：{fmt_price(low20)}
 
-區間內不追高，等方向確認。"""
+🧠 區間內不追高、不殺低，等方向確認。"""
 
-        return f"""📈 HCX AI 股票分析師
+        # 漲跌顏色提示
+        if change > 0:
+            price_icon = "🔴📈"
+        elif change < 0:
+            price_icon = "🟢📉"
+        else:
+            price_icon = "⚪➖"
 
-股票：{code} {stock_name}
-資料來源：{used_source}
+        return f"""🌈✨ HCX AI 股票分析師 ✨🌈
+版本：{APP_VERSION}
 
-現價：{close:.2f}
-漲跌：{change:.2f}
-漲跌幅：{pct:.2f}%
+🏷️ 股票：{code} {stock_name}
+📡 資料來源：{used_source}
 
-MA5：{ma5:.2f}
-MA20：{ma20:.2f}
-MA60：{ma60:.2f}
-ATR14：{atr14:.2f}
+━━━━━━━━━━━━━━
+{price_icon}【即時價格雷達】
+💰 現價：{fmt_price(close)}
+📊 漲跌：{fmt_price(change)}
+📈 漲跌幅：{pct:.2f}%
 
-主力成本估算：{main_cost:.2f}
-成本乖離：{main_cost_diff:.2f} / {main_cost_pct:.2f}%
-籌碼判斷：{main_cost_status}
+━━━━━━━━━━━━━━
+📐【均線結構】
+⚡ MA5：{fmt_price(ma5)}
+🌙 MA20：{fmt_price(ma20)}
+🏔️ MA60：{fmt_price(ma60)}
+🌊 ATR14：{fmt_price(atr14)}
 
-壓力：{high20:.2f}
-支撐：{low20:.2f}
+━━━━━━━━━━━━━━
+{chip_light}【主力成本估算】
+🏦 主力成本：{fmt_price(main_cost)}
+📏 成本乖離：{fmt_price(main_cost_diff)} / {main_cost_pct:.2f}%
+🧩 籌碼判斷：{chip_status}
 
-趨勢判斷：{trend}
+━━━━━━━━━━━━━━
+🧱【支撐壓力】
+🔺 20日壓力：{fmt_price(high20)}
+🔻 20日支撐：{fmt_price(low20)}
+📌 10日高點：{fmt_price(recent_high)}
+📌 10日低點：{fmt_price(recent_low)}
 
-AI建議：
+━━━━━━━━━━━━━━
+{trend_icon}【趨勢判斷】
+目前趨勢：{trend}
+
+🧠 AI專業解讀：
 {advice}
 
-{main_plan}
+━━━━━━━━━━━━━━
+{plan}
 
-備註：主力成本為近20日成交量加權均價估算，非券商實際持股成本。
+━━━━━━━━━━━━━━
+⚠️ 風險提醒
+本訊息為程式估算與技術分析，不代表保證獲利。
+主力成本使用近20日成交量加權均價估算，非券商實際成本。
 """
 
     except Exception as e:
@@ -546,7 +620,7 @@ AI建議：
 
 @app.route("/")
 def home():
-    return "HCX AI LINE BOT 運作中"
+    return f"HCX AI LINE BOT 運作中｜{APP_VERSION}"
 
 
 @app.route("/callback", methods=["POST"])
@@ -575,20 +649,42 @@ def handle_message(event):
     print("========== 收到使用者訊息 ==========", flush=True)
     print(event.message.text, flush=True)
 
-    msg = event.message.text.strip().replace("\n", "").replace("/", "")
+    raw_msg = event.message.text.strip()
+    msg = raw_msg.replace("\n", "").replace("/", "").replace("股票", "").strip()
+
+    # 支援「2330」、「/2330」、「股票2330」、「請查2330」
+    match = re.search(r"(\d{4})", msg)
 
     try:
-        if msg.isdigit() and len(msg) == 4:
-            reply = stock_ai(msg)
+        if match:
+            code = match.group(1)
+            reply = stock_ai(code)
         else:
-            reply = "請輸入4碼股票代號，例如：2330、2454、2317、1717"
+            reply = f"""🌈 HCX AI 股票分析師
+
+請輸入 4 碼股票代號，例如：
+
+🚀 2330 台積電
+⚡ 2454 聯發科
+🏭 2317 鴻海
+🧪 1717 長興
+
+我會幫你分析：
+✅ 股票名稱
+✅ 現價與漲跌幅
+✅ 均線趨勢
+✅ 主力成本估算
+✅ 支撐壓力
+✅ 進場點
+✅ 停損點
+✅ 目標價
+"""
 
         print("========== 準備回覆 ==========", flush=True)
         print(reply, flush=True)
 
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
-
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
