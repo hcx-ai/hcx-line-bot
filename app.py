@@ -13,6 +13,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import os
 import re
 import traceback
+import math
 from io import StringIO
 
 import pandas as pd
@@ -25,7 +26,7 @@ import requests
 # V3 華麗版：多元查詢 + 股票名稱 + 主力成本 + 進出場點位
 # ============================================================
 
-APP_VERSION = "V3 華麗版｜股票名稱＋主力成本＋進出場點位"
+APP_VERSION = "V4 華麗版｜台股Tick修正＋多空價位＋股票名稱＋主力成本"
 
 app = Flask(__name__)
 
@@ -421,9 +422,69 @@ def series_float(series, idx=-1):
     return float(value)
 
 
-def fmt_price(x):
+def tick_size(price):
+    """
+    台股價格跳動單位：
+    10元以下 0.01
+    10~50元 0.05
+    50~100元 0.1
+    100~500元 0.5
+    500~1000元 1
+    1000元以上 5
+    """
+    p = abs(float(price))
+    if p < 10:
+        return 0.01
+    elif p < 50:
+        return 0.05
+    elif p < 100:
+        return 0.1
+    elif p < 500:
+        return 0.5
+    elif p < 1000:
+        return 1
+    else:
+        return 5
+
+
+def round_price_by_tick(price, mode="nearest"):
+    """
+    依台股 Tick 自動修正價位。
+    mode:
+    - nearest：四捨五入到合法跳動價
+    - up：往上修正，適合突破買點、空方停損
+    - down：往下修正，適合停損、跌破價、空方目標
+    """
     try:
-        return f"{float(x):.2f}"
+        price = float(price)
+        t = tick_size(price)
+
+        if mode == "up":
+            fixed = math.ceil((price / t) - 1e-9) * t
+        elif mode == "down":
+            fixed = math.floor((price / t) + 1e-9) * t
+        else:
+            fixed = round(price / t) * t
+
+        return fixed
+    except Exception:
+        return price
+
+
+def fmt_price(x):
+    """
+    顯示合法台股價位，避免 2330 這種千元股出現 2346.79 這種不能掛單的小數。
+    """
+    try:
+        p = round_price_by_tick(float(x), "nearest")
+        t = tick_size(p)
+
+        if t >= 1:
+            return f"{p:.0f}"
+        elif t >= 0.1:
+            return f"{p:.1f}"
+        else:
+            return f"{p:.2f}"
     except Exception:
         return "-"
 
@@ -511,48 +572,81 @@ def stock_ai(code):
             trend_icon = "🟡🔄"
             advice = "均線糾結，屬於震盪整理。等待突破壓力或跌破支撐後再決定方向。"
 
-        # 進出場點位
-        breakout_buy = max(high20, close)
-        breakout_stop = breakout_buy - atr14 * 1.5
-        breakout_target1 = breakout_buy + atr14 * 2.0
-        breakout_target2 = breakout_buy + atr14 * 3.0
+        # 進出場點位：先算理論值，再依台股 Tick 修正成可掛單價
+        breakout_buy_raw = max(high20, close)
+        breakout_stop_raw = breakout_buy_raw - atr14 * 1.5
+        breakout_target1_raw = breakout_buy_raw + atr14 * 2.0
+        breakout_target2_raw = breakout_buy_raw + atr14 * 3.0
 
-        pullback_low = max(low20, ma20 - atr14 * 0.5)
-        pullback_high = ma20 + atr14 * 0.3
-        pullback_stop = pullback_low - atr14 * 1.2
-        pullback_target = recent_high
+        pullback_low_raw = max(low20, ma20 - atr14 * 0.5)
+        pullback_high_raw = ma20 + atr14 * 0.3
+        pullback_stop_raw = pullback_low_raw - atr14 * 1.2
+        pullback_target_raw = recent_high
 
-        weak_trigger = min(low20, close)
-        weak_stop = weak_trigger + atr14 * 1.5
-        weak_target = weak_trigger - atr14 * 2.0
+        weak_trigger_raw = min(low20, close)
+        weak_stop_raw = weak_trigger_raw + atr14 * 1.5
+        weak_target_raw = weak_trigger_raw - atr14 * 2.0
+
+        # 多方：突破買點往上修正，停損往下修正，目標往上修正
+        breakout_buy = round_price_by_tick(breakout_buy_raw, "up")
+        breakout_stop = round_price_by_tick(breakout_stop_raw, "down")
+        breakout_target1 = round_price_by_tick(breakout_target1_raw, "up")
+        breakout_target2 = round_price_by_tick(breakout_target2_raw, "up")
+
+        # 回測買區：低點往上，高點往下，避免給出不能掛單的價格
+        pullback_low = round_price_by_tick(pullback_low_raw, "up")
+        pullback_high = round_price_by_tick(pullback_high_raw, "down")
+        if pullback_low > pullback_high:
+            pullback_low = round_price_by_tick(ma20 - atr14 * 0.3, "down")
+            pullback_high = round_price_by_tick(ma20 + atr14 * 0.3, "up")
+
+        pullback_stop = round_price_by_tick(pullback_stop_raw, "down")
+        pullback_target = round_price_by_tick(pullback_target_raw, "up")
+
+        # 空方：跌破價往下修正，停損往上修正，目標往下修正
+        weak_trigger = round_price_by_tick(weak_trigger_raw, "down")
+        weak_stop = round_price_by_tick(weak_stop_raw, "up")
+        weak_target = round_price_by_tick(weak_target_raw, "down")
+
+        ma20_recover = round_price_by_tick(ma20, "up")
+        current_tick = tick_size(close)
 
         if trend == "偏多":
-            plan = f"""🚀【多方攻擊計畫】
-✅ 突破買點：{fmt_price(breakout_buy)}
-🛡️ 防守停損：{fmt_price(breakout_stop)}
-🎯 第一目標：{fmt_price(breakout_target1)}
-🏆 第二目標：{fmt_price(breakout_target2)}
+            direction_summary = "🟢 主策略偏做多；不建議主動放空，除非跌破支撐且收不回。"
+            plan = f"""🚀【做多價位說明】
+✅ 進場1｜突破追價：站上 {fmt_price(breakout_buy)} 可視為轉強攻擊點
+🛡️ 停損1｜突破失敗：跌破 {fmt_price(breakout_stop)} 先保護資金
+🎯 目標1｜短線停利：{fmt_price(breakout_target1)}
+🏆 目標2｜強勢續抱：{fmt_price(breakout_target2)}
 
-🛡️【回測承接計畫】
-📌 低接區間：{fmt_price(pullback_low)} ~ {fmt_price(pullback_high)}
-🚨 跌破停損：{fmt_price(pullback_stop)}
-🎯 反彈目標：{fmt_price(pullback_target)}"""
+🛡️【做多低接區】
+📌 進場2｜回測承接：{fmt_price(pullback_low)} ~ {fmt_price(pullback_high)}
+🚨 停損2｜跌破防守：{fmt_price(pullback_stop)}
+🎯 反彈目標：{fmt_price(pullback_target)}
+
+🔴【做空條件】
+只有跌破 {fmt_price(weak_trigger)} 且反彈站不回，才考慮偏空。"""
         elif trend == "偏空":
-            plan = f"""📉【偏空防守計畫】
-⚠️ 跌破支撐：{fmt_price(weak_trigger)}
-🛡️ 空方停損：{fmt_price(weak_stop)}
+            direction_summary = "🔴 主策略偏做空或觀望；不建議急著做多，除非重新站回 MA20。"
+            plan = f"""📉【做空價位說明】
+⚠️ 進場1｜跌破放空：跌破 {fmt_price(weak_trigger)} 轉弱
+🛡️ 空方停損：站回 {fmt_price(weak_stop)} 先停損
 🎯 空方目標：{fmt_price(weak_target)}
 
-🔁【轉強觀察】
-若重新站回 MA20：{fmt_price(ma20)}
-偏空看法要降低，避免追空。"""
+🔁【做多轉強條件】
+✅ 重新站回 MA20：{fmt_price(ma20_recover)}
+✅ 再突破壓力：{fmt_price(breakout_buy)}
+若兩個條件都有，偏空看法要降低。"""
         else:
-            plan = f"""🔄【震盪盤操作計畫】
-📍 區間壓力：{fmt_price(high20)}
-📍 區間支撐：{fmt_price(low20)}
+            direction_summary = "🟡 目前震盪盤；做多等突破或支撐守住，做空等跌破支撐，不宜中間追價。"
+            plan = f"""🔄【震盪盤多空價位】
+🟢 做多條件1｜突破壓力：{fmt_price(breakout_buy)}
+🟢 做多條件2｜支撐低接：{fmt_price(pullback_low)} ~ {fmt_price(pullback_high)}
+🛡️ 多方停損：{fmt_price(pullback_stop)}
 
-🚀 突破壓力轉強：{fmt_price(high20)}
-⚠️ 跌破支撐轉弱：{fmt_price(low20)}
+🔴 做空條件｜跌破支撐：{fmt_price(weak_trigger)}
+🛡️ 空方停損：{fmt_price(weak_stop)}
+🎯 空方目標：{fmt_price(weak_target)}
 
 🧠 區間內不追高、不殺低，等方向確認。"""
 
@@ -599,9 +693,16 @@ def stock_ai(code):
 ━━━━━━━━━━━━━━
 {trend_icon}【趨勢判斷】
 目前趨勢：{trend}
+🎯 操作方向：{direction_summary}
 
 🧠 AI專業解讀：
 {advice}
+
+━━━━━━━━━━━━━━
+🧮【台股 Tick 價格修正】
+目前股價級距 Tick：{fmt_price(current_tick)} 元
+✅ 下方進出場價位已自動修正成可掛單價位
+✅ 例如千元股會用 5 元跳動，不會再出現 2346.79 這種小數價
 
 ━━━━━━━━━━━━━━
 {plan}
@@ -675,9 +776,11 @@ def handle_message(event):
 ✅ 均線趨勢
 ✅ 主力成本估算
 ✅ 支撐壓力
-✅ 進場點
+✅ 做多價位
+✅ 做空價位
 ✅ 停損點
 ✅ 目標價
+✅ 台股Tick合法價位
 """
 
         print("========== 準備回覆 ==========", flush=True)
