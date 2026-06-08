@@ -33,12 +33,89 @@ import requests
 # 4. 加入做多 / 做空價位說明
 # ============================================================
 
-APP_VERSION = "V5.3.1 黑暗量子雷達強化版｜只顯示查詢時間＋職業級成本雷達"
+APP_VERSION = "V5.4 會員限定版｜好友白名單＋查詢時間＋職業級成本雷達"
 
 app = Flask(__name__)
 
 configuration = Configuration(access_token=os.environ["LINE_CHANNEL_ACCESS_TOKEN"])
 handler = WebhookHandler(os.environ["LINE_CHANNEL_SECRET"])
+
+# ============================================================
+# 會員限定設定
+# ------------------------------------------------------------
+# Render Environment Variables 可新增：
+#
+# MEMBER_ONLY_MODE=true
+# AUTHORIZED_USER_IDS=Uxxxxxxxx,Uyyyyyyyy
+# ADMIN_USER_IDS=U你的LINE_USER_ID
+#
+# 說明：
+# 1. MEMBER_ONLY_MODE=true 才會啟用會員限制。
+# 2. AUTHORIZED_USER_IDS 放允許查詢的會員 LINE userId，多人用逗號分隔。
+# 3. ADMIN_USER_IDS 放管理員 userId，管理員永遠可以查詢。
+# 4. 不知道 userId 時，請會員傳「我的ID」，再把回覆的 ID 加到 Render。
+# ============================================================
+
+def env_list(name):
+    raw = os.environ.get(name, "")
+    return set(x.strip() for x in raw.split(",") if x.strip())
+
+
+MEMBER_ONLY_MODE = os.environ.get("MEMBER_ONLY_MODE", "false").lower() in ["1", "true", "yes", "y", "on"]
+
+
+def get_allowed_user_ids():
+    return env_list("AUTHORIZED_USER_IDS")
+
+
+def get_admin_user_ids():
+    return env_list("ADMIN_USER_IDS")
+
+
+def get_event_user_id(event):
+    try:
+        return getattr(event.source, "user_id", "") or ""
+    except Exception:
+        return ""
+
+
+def get_event_source_type(event):
+    try:
+        return getattr(event.source, "type", "") or ""
+    except Exception:
+        return ""
+
+
+def is_authorized_user(user_id):
+    if not MEMBER_ONLY_MODE:
+        return True
+
+    if not user_id:
+        return False
+
+    if user_id in get_admin_user_ids():
+        return True
+
+    return user_id in get_allowed_user_ids()
+
+
+def member_block_message(user_id):
+    return f"""🔒 HCX AI 會員限定提醒
+
+很抱歉，此帳號尚未開通會員查詢權限。
+
+📌 你的會員識別ID：
+{user_id or "無法取得 userId"}
+
+請把這組 ID 傳給管理員開通。
+
+✅ 開通後即可使用：
+📈 股票分析
+🏦 主力成本雷達
+🎯 做多 / 做空價位
+🛡️ 停損與目標價
+"""
+
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -908,23 +985,70 @@ def handle_message(event):
     print("========== 收到使用者訊息 ==========", flush=True)
     print(event.message.text, flush=True)
 
+    user_id = get_event_user_id(event)
+    source_type = get_event_source_type(event)
+
     raw_msg = event.message.text.strip()
     msg = raw_msg.replace("\n", "").replace("/", "").replace("股票", "").strip()
+
+    print(f"來源類型 source_type={source_type}", flush=True)
+    print(f"使用者 user_id={user_id}", flush=True)
 
     # 支援：2330、/2330、股票2330、請查2330
     match = re.search(r"(\d{4})", msg)
 
     try:
-        if match:
-            code = match.group(1)
-            reply = stock_ai(code)
-        elif "版本" in msg:
-            reply = f"HCX AI 股票分析師目前版本：{APP_VERSION}"
-        elif "更新名稱" in msg or "清除快取" in msg:
-            fetch_market_meta(force=True)
-            reply = "✅ 已重新抓取 TWSE / TPEx 官方股票名稱快取。請再輸入股票代號測試。"
-        else:
+        # 先處理不需要會員權限的基本指令
+        if msg in ["版本", "version", "Version"]:
             reply = f"""🌈 HCX AI 股票分析師
+
+目前版本：
+{APP_VERSION}
+
+會員限制：
+{"已啟用 🔒" if MEMBER_ONLY_MODE else "未啟用 🔓"}
+
+你的ID：
+{user_id or "無法取得 userId"}
+"""
+
+        elif msg in ["我的ID", "我的id", "ID", "id", "會員ID", "會員id"]:
+            reply = f"""🪪 HCX AI 會員識別ID
+
+你的 LINE userId：
+
+{user_id or "無法取得 userId"}
+
+請把這組 ID 傳給管理員開通會員權限。
+"""
+
+        elif "更新名稱" in msg or "清除快取" in msg:
+            # 更新名稱只有管理員可用；未設定會員模式時允許使用
+            if MEMBER_ONLY_MODE and user_id not in get_admin_user_ids():
+                reply = "🔒 此指令限管理員使用。"
+            else:
+                fetch_market_meta(force=True)
+                reply = "✅ 已重新抓取 TWSE / TPEx 官方股票名稱快取。請再輸入股票代號測試。"
+
+        else:
+            # 群組 / 多人聊天室不建議開放，避免會員內容被轉傳到群組
+            if source_type and source_type != "user":
+                reply = """🔒 HCX AI 會員限定提醒
+
+本服務限定「一對一好友聊天室」使用。
+請不要在群組或多人聊天室查詢，避免會員內容外流。
+"""
+
+            # 會員白名單檢查
+            elif not is_authorized_user(user_id):
+                reply = member_block_message(user_id)
+
+            elif match:
+                code = match.group(1)
+                reply = stock_ai(code)
+
+            else:
+                reply = f"""🌈 HCX AI 股票分析師
 
 請輸入 4 碼股票代號，例如：
 
@@ -947,7 +1071,7 @@ def handle_message(event):
 
 指令：
 輸入「版本」可確認目前是否已部署最新版。
-輸入「更新名稱」可重新抓取官方股票名稱快取。
+輸入「我的ID」可取得會員開通用 ID。
 """
 
         print("========== 準備回覆 ==========", flush=True)
