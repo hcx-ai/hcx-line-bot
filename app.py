@@ -29,14 +29,9 @@ import requests
 # ============================================================
 # HCX AI 股票分析師 LINE Bot
 # V5 HCX-AI量子雷達強化版
-# 重點：
-# 1. 參考HCX-AI量子雷達：先抓 TWSE / TPEx 官方全市場資料，代號與名稱一起建立快取
-# 2. 股票名稱不再只靠 yfinance，避免 2330 2330、1717 1717
-# 3. 加入主力成本估算、支撐壓力、台股 Tick 合法價位
-# 4. 加入做多 / 做空價位說明
-# ============================================================
 
-APP_VERSION = "V6.0 會員限定版｜600檔量子篩選＋Tick成本獲利提醒"
+
+APP_VERSION = "V6.1 正式版｜600檔量子篩選＋5000張量能門檻＋Tick成本提醒"
 
 app = Flask(__name__)
 
@@ -1158,6 +1153,60 @@ def get_quantum_top_n():
         return 5
 
 
+def get_quantum_min_volume_lots():
+    """
+    V6.1 當沖量能門檻：
+    預設至少 5000 張，避免選出成交量太小、不好進出的股票。
+    Render 可用 QUANTUM_MIN_VOLUME_LOTS 微調，但最低不低於 1000 張。
+    """
+    try:
+        n = int(float(os.environ.get("QUANTUM_MIN_VOLUME_LOTS", "5000")))
+        return max(1000, min(n, 50000))
+    except Exception:
+        return 5000
+
+
+def get_quantum_min_value_m():
+    """
+    V6.1 成交金額門檻：
+    預設至少 100 百萬，避免只靠低價股大量但不好操作。
+    Render 可用 QUANTUM_MIN_VALUE_M 微調。
+    """
+    try:
+        n = float(os.environ.get("QUANTUM_MIN_VALUE_M", "100"))
+        return max(20.0, min(n, 5000.0))
+    except Exception:
+        return 100.0
+
+
+def volume_shares_to_lots(volume_shares):
+    """
+    TWSE / TPEx / yfinance 常見回傳為股數，這裡統一轉成張數。
+    """
+    try:
+        v = float(volume_shares or 0)
+        return max(0.0, v / 1000.0)
+    except Exception:
+        return 0.0
+
+
+def calc_value_m(close, volume_shares):
+    """
+    成交金額百萬估算：股價 * 股數 / 1,000,000。
+    """
+    try:
+        return max(0.0, float(close or 0) * float(volume_shares or 0) / 1_000_000.0)
+    except Exception:
+        return 0.0
+
+
+def fmt_lots(x):
+    try:
+        return f"{float(x):,.0f}"
+    except Exception:
+        return "-"
+
+
 def is_common_stock(code, name):
     """
     排除 ETF、ETN、權證、特殊商品。
@@ -1184,13 +1233,19 @@ def is_common_stock(code, name):
 
 def get_quantum_universe():
     """
-    B方案候選池：
-    先抓全市場官方資料，依成交量/成交值排序取 600 檔。
-    後續 run_quantum_scan 會再做：
-    600 → 100 → 30 → 5
+    V6.1 B方案候選池：
+    1. 抓官方全市場資料。
+    2. 先排除 ETF / 權證 / 特殊商品。
+    3. 套用當沖量能門檻：
+       - 成交量至少 5000 張
+       - 成交金額至少 100 百萬
+    4. 依成交金額、成交量取前 600 檔。
     """
     meta = fetch_market_meta()
     rows = []
+
+    min_lots = get_quantum_min_volume_lots()
+    min_value_m = get_quantum_min_value_m()
 
     for code, item in meta.items():
         name = clean_text(item.get("名稱") or FALLBACK_STOCK_NAMES.get(code) or code)
@@ -1211,10 +1266,16 @@ def get_quantum_universe():
         except Exception:
             vol_f = 0.0
 
-        if close_f > 0 and close_f < 5:
+        if close_f <= 0 or close_f < 5:
             continue
 
-        value_score = close_f * vol_f
+        vol_lots = volume_shares_to_lots(vol_f)
+        value_m = calc_value_m(close_f, vol_f)
+
+        if vol_lots < min_lots:
+            continue
+        if value_m < min_value_m:
+            continue
 
         rows.append({
             "code": code,
@@ -1222,12 +1283,14 @@ def get_quantum_universe():
             "market": market,
             "close": close_f,
             "volume": vol_f,
-            "official_value": value_score,
+            "volume_lots": vol_lots,
+            "official_value_m": value_m,
+            "official_value": close_f * vol_f,
         })
 
     rows = sorted(
         rows,
-        key=lambda x: (float(x.get("official_value") or 0), float(x.get("volume") or 0)),
+        key=lambda x: (float(x.get("official_value_m") or 0), float(x.get("volume_lots") or 0)),
         reverse=True
     )
     return rows[:get_quantum_scan_limit()]
@@ -1236,18 +1299,17 @@ def get_quantum_universe():
 def select_stage1_candidates(universe, command):
     """
     第一層：600 → 100。
-    用官方成交量/成交值快速篩選，讓搜尋範圍夠大，但不會慢到會員等太久。
+    比照原本量子雷達精神：先用成交量 / 成交金額建立活躍母體。
+    V6.1 已先排除低於5000張或成交金額不足標的。
     """
     if not universe:
         return []
 
     limit = get_quantum_stage1_limit()
 
-    # 當沖多/空/股：優先成交值與成交量，避免冷門股。
-    # 隔日沖：同樣保留成交值，避免隔日流動性不足。
     ranked = sorted(
         universe,
-        key=lambda x: (float(x.get("official_value") or 0), float(x.get("volume") or 0)),
+        key=lambda x: (float(x.get("official_value_m") or 0), float(x.get("volume_lots") or 0)),
         reverse=True
     )
 
@@ -1709,7 +1771,8 @@ def score_quantum_candidate(df, kind, code=None, market=None):
     volume = float(vol_series.iloc[-1]) if not pd.isna(vol_series.iloc[-1]) else 0.0
     vol_ma20 = float(vol_series.rolling(20).mean().iloc[-1])
     vol_ratio = float(volume / vol_ma20) if vol_ma20 > 0 else 0
-    value_m = close * volume / 1_000_000.0
+    volume_lots = volume_shares_to_lots(volume)
+    value_m = calc_value_m(close, volume)
     atr = calc_atr14(high_series, low_series, close_series)
 
     win_rate, samples = estimate_strategy_win_rate(df, kind if kind != "intraday_best" else "intraday_long")
@@ -1718,6 +1781,7 @@ def score_quantum_candidate(df, kind, code=None, market=None):
         "close": close,
         "pct": pct,
         "volume": volume,
+        "volume_lots": volume_lots,
         "value_m": value_m,
         "day_high": day_high,
         "day_low": day_low,
@@ -1830,7 +1894,15 @@ def apply_hcx_daily_radar_ranking(command, rows):
     value_scores = _percentile_list(vals)
 
     ranked = []
+    min_lots = get_quantum_min_volume_lots()
+    min_value_m = get_quantum_min_value_m()
+
     for r, volume_score, value_score in zip(rows, volume_scores, value_scores):
+        if float(r.get("volume_lots") or 0) < min_lots:
+            continue
+        if float(r.get("value_m") or 0) < min_value_m:
+            continue
+
         pct = float(r.get("pct") or 0)
         pos20 = _clip_score(r.get("pos20", 50))
         amplitude = float(r.get("amplitude") or 0)
@@ -1941,7 +2013,7 @@ def format_quantum_top_report(command, rows):
         "⚡ HCX-AI量子雷達",
         f"🕒 查詢時間：{query_time_text()}",
         f"{title_map.get(command, command)}",
-        "📦 搜尋範圍：600檔 → 100 → 30 → TOP5",
+        f"📦 搜尋範圍：600檔 → 100 → 30 → TOP5｜最低量能 {get_quantum_min_volume_lots():,} 張",
         "━━━━━━━━━━━━━━",
     ]
 
@@ -1949,7 +2021,7 @@ def format_quantum_top_report(command, rows):
         direction = r.get("signal", "職業當沖觀察")
         lines.append(
             f"{idx}. {r['code']} {r['name']}｜{direction}\n"
-            f"   收盤 {fmt_price(r['close'])}｜漲跌 {r['pct']:+.2f}%｜量比 {r['vol_ratio']:.2f}\n"
+            f"   收盤 {fmt_price(r['close'])}｜漲跌 {r['pct']:+.2f}%｜成交量 {fmt_lots(r.get('volume_lots'))}張｜量比 {r['vol_ratio']:.2f}\n"
             f"   🏆 AI勝率 {r['win_rate']:.1f}%｜樣本 {r['samples']}｜職業評分 {r['rank_score']:.1f}\n"
             f"   🎯 建議進場價：{fmt_price(r['entry'])}\n"
             f"   ✅ 建議停利價：{fmt_price(r['take_profit'])}\n"
@@ -1986,8 +2058,17 @@ def process_quantum_item(item, kind):
 
     metrics = score_quantum_candidate(df, kind, code=code, market=meta["market"])
 
-    # 基本流動性保護，避免冷門股進入當沖前五名
-    if metrics.get("close", 0) < 5 or metrics.get("value_m", 0) < 20:
+    # V6.1 基本流動性保護：避免冷門股進入當沖前五名
+    official_lots = float(item.get("volume_lots") or 0)
+    official_value_m = float(item.get("official_value_m") or 0)
+    metrics["volume_lots"] = max(float(metrics.get("volume_lots") or 0), official_lots)
+    metrics["value_m"] = max(float(metrics.get("value_m") or 0), official_value_m)
+
+    if metrics.get("close", 0) < 5:
+        return None
+    if metrics.get("volume_lots", 0) < get_quantum_min_volume_lots():
+        return None
+    if metrics.get("value_m", 0) < get_quantum_min_value_m():
         return None
 
     return {
@@ -2105,7 +2186,7 @@ def run_quantum_scan_and_push(user_id, command):
         try:
             push_text_message(
                 user_id,
-                f"⚠️ {command} 掃描發生錯誤：{e}\n請稍後再試，或降低 QUANTUM_SCAN_LIMIT。"
+                f"⚠️ {command} 掃描發生錯誤：{e}\n請稍後再試，或先確認 Render 是否已部署 V6.1 正式版。"
             )
         except Exception:
             pass
@@ -2129,6 +2210,7 @@ def start_quantum_scan(user_id, command):
 
 📊 掃描模式：選股日報核心 TOP 5
 📦 搜尋範圍：600檔 → 100 → 30 → TOP5
+📦 最低量能門檻：5,000張
 🕒 查詢時間：{query_time_text()}
 
 稍後會自動推播結果給你。
