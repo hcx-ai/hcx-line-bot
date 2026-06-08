@@ -27,15 +27,15 @@ import requests
 
 # ============================================================
 # HCX AI 股票分析師 LINE Bot
-# V5 黑暗量子雷達強化版
+# V5 HCX-AI量子雷達強化版
 # 重點：
-# 1. 參考黑暗量子雷達：先抓 TWSE / TPEx 官方全市場資料，代號與名稱一起建立快取
+# 1. 參考HCX-AI量子雷達：先抓 TWSE / TPEx 官方全市場資料，代號與名稱一起建立快取
 # 2. 股票名稱不再只靠 yfinance，避免 2330 2330、1717 1717
 # 3. 加入主力成本估算、支撐壓力、台股 Tick 合法價位
 # 4. 加入做多 / 做空價位說明
 # ============================================================
 
-APP_VERSION = "V5.5.1 會員限定版｜量子指令辨識強化＋當沖多空＋隔日沖TOP10"
+APP_VERSION = "V5.6 會員限定版｜量子TOP5＋前30名掃描＋前日1230支撐進場價"
 
 app = Flask(__name__)
 
@@ -102,7 +102,7 @@ def is_authorized_user(user_id):
 
 
 def member_block_message(user_id):
-    return f"""🔒 HCX AI 會員限定提醒
+    return f"""🔒 HCX-AI 會員限定提醒
 
 很抱歉，此帳號尚未開通會員查詢權限。
 
@@ -233,7 +233,7 @@ def request_json(url, params=None, timeout=12, tries=2):
 
 def normalize_official_rows(data, market):
     """
-    參考黑暗量子雷達邏輯：
+    參考HCX-AI量子雷達邏輯：
     將 TWSE / TPEx 不同欄位名稱統一成 代號、名稱、市場、收盤。
     """
     rows = []
@@ -956,7 +956,7 @@ def stock_ai(code):
 # 1. 使用官方代號名稱快取取得全市場名單。
 # 2. 先取成交量較活躍股票，避免 LINE 即時服務掃描過久。
 # 3. 使用日K量價條件 + 簡化回測估算 AI勝率。
-# 4. 這是 LINE 輕量版雷達；完整精準版仍建議由 Colab 黑暗量子雷達跑完整報表。
+# 4. 這是HCX-AI量子雷達；完整精準版仍建議由 Colab HCX量子雷達跑完整報表。
 # ============================================================
 
 QUANTUM_COMMANDS = {
@@ -1025,25 +1025,29 @@ def push_text_message(user_id, text):
     return True
 
 
+
 def get_quantum_scan_limit():
     """
-    掃描檔數可用 Render Environment Variable 控制：
-    QUANTUM_SCAN_LIMIT=120
-    預設 100，避免免費 Render 掃太久。
+    量子選股只搜尋前30名活躍股。
+    若 Render Environment Variable 有設定 QUANTUM_SCAN_LIMIT，仍以30為上限。
     """
     try:
-        n = int(os.environ.get("QUANTUM_SCAN_LIMIT", "100"))
-        return max(30, min(n, 250))
+        n = int(os.environ.get("QUANTUM_SCAN_LIMIT", "30"))
+        return max(10, min(n, 30))
     except Exception:
-        return 100
+        return 30
+
 
 
 def get_quantum_top_n():
+    """
+    LINE 推播只顯示前5名，避免訊息太長。
+    """
     try:
-        n = int(os.environ.get("QUANTUM_TOP_N", "10"))
-        return max(1, min(n, 10))
+        n = int(os.environ.get("QUANTUM_TOP_N", "5"))
+        return max(1, min(n, 5))
     except Exception:
-        return 10
+        return 5
 
 
 def is_common_stock(code, name):
@@ -1185,7 +1189,7 @@ def _is_signal(feat, kind):
 def _signal_success(df, i, feat, kind):
     """
     用隔日K近似回測勝率。
-    注意：LINE輕量版沒有逐筆成交與1分K，這裡是策略勝率估算。
+    注意：LINE沒有逐筆成交與1分K，這裡是策略勝率估算。
     """
     next_high = float(df["High"].iloc[i + 1])
     next_low = float(df["Low"].iloc[i + 1])
@@ -1239,7 +1243,190 @@ def estimate_strategy_win_rate(df, kind, lookback=120):
         return 50.0, 0
 
 
-def score_quantum_candidate(df, kind):
+def get_prev_1230_1330_levels(code, market):
+    """
+    取得前一個交易日 12:30~13:30 的盤中支撐/壓力。
+    進場價核心：
+    - 當沖多 / 隔日沖：以前日 12:30~13:30 支撐做建議進場價
+    - 當沖空：以跌破前日 12:30~13:30 支撐做偏空進場觀察
+    """
+    symbols = yahoo_symbols_by_meta(code, market)
+
+    for symbol in symbols:
+        try:
+            df_i = yf.download(
+                symbol,
+                period="7d",
+                interval="5m",
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+                prepost=False
+            )
+
+            if df_i is None or df_i.empty:
+                continue
+
+            if isinstance(df_i.columns, pd.MultiIndex):
+                df_i.columns = [c[0] if isinstance(c, tuple) else c for c in df_i.columns]
+
+            if "High" not in df_i.columns or "Low" not in df_i.columns or "Close" not in df_i.columns:
+                continue
+
+            df_i = df_i[["High", "Low", "Close"]].copy()
+            df_i["High"] = pd.to_numeric(df_i["High"], errors="coerce")
+            df_i["Low"] = pd.to_numeric(df_i["Low"], errors="coerce")
+            df_i["Close"] = pd.to_numeric(df_i["Close"], errors="coerce")
+            df_i = df_i.dropna()
+
+            if df_i.empty:
+                continue
+
+            idx = pd.to_datetime(df_i.index)
+            try:
+                if idx.tz is None:
+                    # 台股 yfinance 有時回傳無時區，這裡直接視為台北時間。
+                    idx = idx.tz_localize("Asia/Taipei")
+                else:
+                    idx = idx.tz_convert("Asia/Taipei")
+            except Exception:
+                pass
+
+            df_i.index = idx
+
+            taiwan_today = datetime.now(timezone(timedelta(hours=8))).date()
+            dates = sorted(set([x.date() for x in df_i.index if x.date() < taiwan_today]))
+
+            if not dates:
+                dates = sorted(set([x.date() for x in df_i.index]))
+
+            if not dates:
+                continue
+
+            prev_date = dates[-1]
+            t_start = datetime.strptime("12:30", "%H:%M").time()
+            t_end = datetime.strptime("13:30", "%H:%M").time()
+            window = df_i[
+                (df_i.index.date == prev_date) &
+                (df_i.index.time >= t_start) &
+                (df_i.index.time <= t_end)
+            ]
+
+            if window.empty:
+                # 若 yfinance 盤中資料不足，退而用前一交易日最後60分鐘。
+                day_df = df_i[df_i.index.date == prev_date]
+                window = day_df.tail(12)
+
+            if window.empty:
+                continue
+
+            support = float(window["Low"].min())
+            resistance = float(window["High"].max())
+            mid = float(window["Close"].iloc[-1])
+
+            return {
+                "ok": True,
+                "date": pd.Timestamp(prev_date).strftime("%Y-%m-%d"),
+                "support": support,
+                "resistance": resistance,
+                "mid": mid,
+                "source": f"{symbol} 5m",
+            }
+
+        except Exception as e:
+            print(f"前日1230支撐抓取失敗 {code} {symbol}: {e}", flush=True)
+            continue
+
+    return {
+        "ok": False,
+        "date": "",
+        "support": None,
+        "resistance": None,
+        "mid": None,
+        "source": "無盤中5分K資料，改用日K備援"
+    }
+
+
+def calc_take_profit_by_60_percent(entry, stop, kind):
+    """
+    停利價：以風險距離的0.6倍當作帳面正報酬停利。
+    並套入台股 Tick，避免出現不能掛單的小數價。
+    """
+    entry = float(entry)
+    stop = float(stop)
+    t = tick_size(entry)
+
+    if kind == "intraday_short":
+        risk = abs(stop - entry)
+        reward = max(risk * 0.60, t * 2)
+        return round_price_by_tick(entry - reward, "down")
+
+    risk = abs(entry - stop)
+    reward = max(risk * 0.60, t * 2)
+    return round_price_by_tick(entry + reward, "up")
+
+
+def build_quantum_trade_plan(code, market, kind, close, high20, low20, atr):
+    """
+    建議進場 / 停利 / 停損：
+    1. 優先使用前一交易日 12:30~13:30 支撐。
+    2. 停利用 0.6R 帳面正報酬邏輯。
+    3. 全部套台股 Tick 修正。
+    """
+    levels = get_prev_1230_1330_levels(code, market)
+    t = tick_size(close)
+
+    if levels.get("ok"):
+        support = float(levels["support"])
+        resistance = float(levels["resistance"])
+        one_hour_range = max(resistance - support, t * 3)
+
+        if kind == "intraday_short":
+            # 當沖空：跌破前日12:30~13:30支撐才啟動偏空。
+            entry = round_price_by_tick(support, "down")
+            stop_raw = max(resistance, entry + max(one_hour_range * 0.60, atr * 0.25, t * 3))
+            stop = round_price_by_tick(stop_raw, "up")
+            take_profit = calc_take_profit_by_60_percent(entry, stop, kind)
+            basis = f"跌破前日{levels['date']} 12:30~13:30支撐"
+        else:
+            # 當沖多 / 隔日沖：以前日12:30~13:30支撐作建議承接價。
+            entry = round_price_by_tick(support, "nearest")
+            stop_raw = entry - max(one_hour_range * 0.60, atr * 0.25, t * 3)
+            stop = round_price_by_tick(stop_raw, "down")
+            take_profit = calc_take_profit_by_60_percent(entry, stop, kind)
+            basis = f"前日{levels['date']} 12:30~13:30支撐"
+
+        return {
+            "entry": entry,
+            "take_profit": take_profit,
+            "stop": stop,
+            "basis": basis,
+            "support_1230": support,
+            "resistance_1230": resistance,
+        }
+
+    # 沒有盤中資料時，用日K支撐備援
+    if kind == "intraday_short":
+        entry = round_price_by_tick(min(low20, close), "down")
+        stop = round_price_by_tick(entry + max(atr * 0.70, t * 3), "up")
+        take_profit = calc_take_profit_by_60_percent(entry, stop, kind)
+        basis = "日K支撐備援，未取得前日12:30~13:30資料"
+    else:
+        entry = round_price_by_tick(max(low20, close - atr * 0.50), "nearest")
+        stop = round_price_by_tick(entry - max(atr * 0.70, t * 3), "down")
+        take_profit = calc_take_profit_by_60_percent(entry, stop, kind)
+        basis = "日K支撐備援，未取得前日12:30~13:30資料"
+
+    return {
+        "entry": entry,
+        "take_profit": take_profit,
+        "stop": stop,
+        "basis": basis,
+        "support_1230": None,
+        "resistance_1230": None,
+    }
+
+def score_quantum_candidate(df, kind, code=None, market=None):
     close_series = pd.to_numeric(df["Close"], errors="coerce")
     high_series = pd.to_numeric(df["High"], errors="coerce")
     low_series = pd.to_numeric(df["Low"], errors="coerce")
@@ -1260,7 +1447,6 @@ def score_quantum_candidate(df, kind):
     vol_ratio = float(vol_series.iloc[-1] / vol_ma20) if vol_ma20 > 0 else 0
     atr = calc_atr14(high_series, low_series, close_series)
 
-    # 分數正規化
     vol_score = min(max(vol_ratio / 2.0 * 100, 0), 100)
 
     if kind == "intraday_long":
@@ -1268,39 +1454,35 @@ def score_quantum_candidate(df, kind):
         pct_score = min(max((pct + 2) / 7 * 100, 0), 100)
         pos_score = min(max(pos20, 0), 100)
         score = vol_score * 0.25 + trend_score * 0.30 + pct_score * 0.20 + pos_score * 0.25
-
-        entry = round_price_by_tick(max(high20, close), "up")
-        stop = round_price_by_tick(entry - atr * 1.15, "down")
-        target = round_price_by_tick(entry + atr * 1.60, "up")
-        signal = "突破續強" if close >= ma20 else "回測觀察"
+        signal = "當沖多｜支撐承接"
 
     elif kind == "intraday_short":
         trend_score = 100 if close < ma5 <= ma20 else 70 if close < ma20 else 40
         pct_score = min(max((-pct + 2) / 7 * 100, 0), 100)
         pos_score = min(max(100 - pos20, 0), 100)
         score = vol_score * 0.25 + trend_score * 0.30 + pct_score * 0.20 + pos_score * 0.25
-
-        entry = round_price_by_tick(min(low20, close), "down")
-        stop = round_price_by_tick(entry + atr * 1.15, "up")
-        target = round_price_by_tick(entry - atr * 1.60, "down")
-        signal = "跌破轉弱" if close <= ma20 else "反彈空觀察"
+        signal = "當沖空｜跌破支撐"
 
     else:
         trend_score = 100 if close > ma20 else 70 if close > ma60 else 45
         pct_score = min(max((pct + 2) / 8 * 100, 0), 100)
         pos_score = min(max(pos20, 0), 100)
         score = vol_score * 0.30 + trend_score * 0.25 + pct_score * 0.20 + pos_score * 0.25
-
-        entry = round_price_by_tick(max(high20, close), "up")
-        stop = round_price_by_tick(max(low20, close - atr * 1.20), "down")
-        target = round_price_by_tick(entry + atr * 1.80, "up")
-        signal = "隔日沖觀察"
+        signal = "隔日沖｜支撐承接"
 
     win_rate, samples = estimate_strategy_win_rate(df, kind)
-
-    # 以勝率為主，分數為輔；樣本太少時降低權重
     sample_factor = min(samples / 8, 1.0)
     rank_score = win_rate * (0.70 * sample_factor + 0.35 * (1 - sample_factor)) + score * (0.30 * sample_factor + 0.65 * (1 - sample_factor))
+
+    trade_plan = build_quantum_trade_plan(
+        code=code or "",
+        market=market or "上市",
+        kind=kind,
+        close=close,
+        high20=high20,
+        low20=low20,
+        atr=atr
+    )
 
     return {
         "close": close,
@@ -1310,18 +1492,19 @@ def score_quantum_candidate(df, kind):
         "samples": samples,
         "rank_score": rank_score,
         "vol_ratio": vol_ratio,
-        "entry": entry,
-        "stop": stop,
-        "target": target,
+        "entry": trade_plan["entry"],
+        "take_profit": trade_plan["take_profit"],
+        "stop": trade_plan["stop"],
+        "basis": trade_plan["basis"],
         "signal": signal,
     }
 
 
 def format_quantum_top_report(command, rows):
     title_map = {
-        "當沖多": "🔴 當沖多 TOP 10｜AI勝率排行",
-        "當沖空": "🟢 當沖空 TOP 10｜AI勝率排行",
-        "隔日沖": "🟠 隔日沖 TOP 10｜AI勝率排行",
+        "當沖多": "🔴 當沖多 TOP 5｜AI勝率排行",
+        "當沖空": "🟢 當沖空 TOP 5｜AI勝率排行",
+        "隔日沖": "🟠 隔日沖 TOP 5｜AI勝率排行",
     }
 
     if not rows:
@@ -1331,32 +1514,35 @@ def format_quantum_top_report(command, rows):
 📌 指令：{command}
 
 本次沒有符合條件的股票。
-可稍後盤中再查，或放寬掃描檔數。
+可稍後盤中再查，或放寬掃描條件。
 """
 
     lines = [
         "⚡ HCX 黑暗量子 LINE 雷達",
         f"🕒 查詢時間：{query_time_text()}",
         f"{title_map.get(command, command)}",
+        "📦 搜尋範圍：活躍股前30名",
         "━━━━━━━━━━━━━━",
     ]
 
     for idx, r in enumerate(rows[:get_quantum_top_n()], 1):
         lines.append(
-            f"{idx}. {r['code']} {r['name']}｜收 {fmt_price(r['close'])}｜漲跌 {r['pct']:.2f}%\n"
-            f"   🏆 AI勝率 {r['win_rate']:.1f}%｜樣本 {r['samples']}｜分 {r['score']:.1f}｜量比 {r['vol_ratio']:.2f}\n"
-            f"   📌 {r['signal']}｜觀察 {fmt_price(r['entry'])}｜停損 {fmt_price(r['stop'])}｜目標 {fmt_price(r['target'])}"
+            f"{idx}. {r['code']} {r['name']}\n"
+            f"   收盤 {fmt_price(r['close'])}｜漲跌 {r['pct']:+.2f}%｜量比 {r['vol_ratio']:.2f}\n"
+            f"   🏆 AI勝率 {r['win_rate']:.1f}%｜樣本 {r['samples']}｜分數 {r['score']:.1f}\n"
+            f"   🎯 建議進場價：{fmt_price(r['entry'])}\n"
+            f"   ✅ 建議停利價：{fmt_price(r['take_profit'])}\n"
+            f"   🛑 建議停損價：{fmt_price(r['stop'])}\n"
+            f"   📌 依據：{r['basis']}"
         )
 
     lines.extend([
         "━━━━━━━━━━━━━━",
-        "⚠️ 勝率為LINE輕量版用日K與量價訊號估算，不等於保證獲利。",
-        "⚠️ 當沖實戰仍需搭配盤中即時價、成交量、支撐壓力與停損紀律。",
+        "⚠️ 勝率為量價與歷史日K訊號估算，不保證獲利。",
+        "⚠️ 盤中請搭配即時量能、分K轉折與停損紀律。",
     ])
 
     text = "\n".join(lines)
-
-    # LINE 單則文字上限約 5000 字，保險裁切
     return text[:4800]
 
 
@@ -1377,7 +1563,7 @@ def run_quantum_scan(command):
             if df is None or df.empty or len(df) < 80:
                 continue
 
-            metrics = score_quantum_candidate(df, kind)
+            metrics = score_quantum_candidate(df, kind, code=code, market=meta["market"])
 
             # 低分先濾掉，避免冷門或方向不明股票亂入
             if metrics["score"] < 50:
@@ -1428,10 +1614,10 @@ def start_quantum_scan(user_id, command):
 
     return f"""⚡ 已收到「{command}」指令
 
-系統正在啟動黑暗量子 LINE 雷達掃描中...
+系統正在啟動HCX-AI量子雷達掃描中...
 
-📊 掃描模式：AI勝率排行 TOP 10
-📦 掃描檔數：前 {get_quantum_scan_limit()} 檔活躍股
+📊 掃描模式：AI勝率排行 TOP 5
+📦 掃描檔數：前30檔活躍股
 🕒 查詢時間：{query_time_text()}
 
 稍後會自動推播結果給你。
@@ -1558,9 +1744,9 @@ def handle_message(event):
 ✅ 目標價
 
 量子選股指令：
-🔴 輸入「當沖多」：列出當沖多 TOP 10
-🟢 輸入「當沖空」：列出當沖空 TOP 10
-🟠 輸入「隔日沖」：列出隔日沖 TOP 10
+🔴 輸入「當沖多」：列出當沖多 TOP 5
+🟢 輸入「當沖空」：列出當沖空 TOP 5
+🟠 輸入「隔日沖」：列出隔日沖 TOP 5
 
 也支援：
 /當沖多、當沖 多、當衝多、我要當沖多
