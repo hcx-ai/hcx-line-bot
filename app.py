@@ -16,8 +16,8 @@ import re
 import math
 import time
 import traceback
-import threading
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from io import StringIO
@@ -37,7 +37,7 @@ import requests
 # 4. 加入做多 / 做空價位說明
 # ============================================================
 
-APP_VERSION = "V6.4 正式版｜會員自訂定時提醒＋量子雷達每日可出榜"
+APP_VERSION = "V6.5 正式版｜修正空榜＋會員提醒＋隱藏內部篩選"
 
 app = Flask(__name__)
 
@@ -1111,336 +1111,288 @@ def push_text_message(user_id, text):
 
 
 # ============================================================
-# 會員自訂定時提醒
+# 會員自訂提醒排程
 # ------------------------------------------------------------
-# 會員可在 LINE 輸入：
+# 支援指令：
 # 設定提醒 當沖多 08:50
-# 設定提醒 當沖空 08:55
+# 設定提醒 當沖空 09:00
 # 設定提醒 隔日沖 13:35
-# 設定提醒 全部 08:50
 # 我的提醒
 # 取消提醒 當沖多
 # 取消全部提醒
 #
-# Render 免費版會休眠；若要準時，建議用 cron-job.org 或 UptimeRobot
-# 每分鐘打一次：
-# https://你的服務.onrender.com/cron
-#
-# 若有設定 CRON_SECRET，網址改成：
-# https://你的服務.onrender.com/cron?key=你的密碼
+# 注意：
+# Render 免費版會休眠，若服務睡著，排程不會準時觸發。
+# 建議用 cron-job.org / UptimeRobot 在 08:48 先喚醒 Render。
 # ============================================================
 
-REMINDER_FILE = os.environ.get("HCX_REMINDER_FILE", "/tmp/hcx_line_reminders.json")
-REMINDER_COMMAND_LIST = ["當沖多", "當沖空", "隔日沖"]
+REMINDER_SCHEDULE_FILE = os.environ.get("REMINDER_SCHEDULE_FILE", "/tmp/hcx_line_member_reminders.json")
 REMINDER_LOCK = threading.Lock()
-_SCHEDULER_STARTED = False
+REMINDER_SCHEDULES = {}
+REMINDER_SCHEDULER_STARTED = False
 
 
-def _tw_now():
+def taipei_now():
     return datetime.now(timezone(timedelta(hours=8)))
 
 
-def _is_tw_weekday(dt=None):
-    dt = dt or _tw_now()
-    # 0=Monday, 6=Sunday
-    return dt.weekday() < 5
-
-
-def reminder_weekdays_only():
-    return str(os.environ.get("REMINDER_WEEKDAYS_ONLY", "true")).strip().lower() not in ("0", "false", "no", "off")
-
-
-def load_reminder_store():
-    default = {"schedules": {}, "last_sent": {}}
+def _safe_load_json(path, default):
     try:
-        p = Path(REMINDER_FILE)
+        p = Path(path)
         if not p.exists():
             return default
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return default
-        data.setdefault("schedules", {})
-        data.setdefault("last_sent", {})
-        return data
-    except Exception as e:
-        print(f"讀取提醒設定失敗：{e}", flush=True)
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else default
+    except Exception:
         return default
 
 
-def save_reminder_store(data):
+def load_reminder_schedules():
+    global REMINDER_SCHEDULES
+    with REMINDER_LOCK:
+        REMINDER_SCHEDULES = _safe_load_json(REMINDER_SCHEDULE_FILE, {})
+        return REMINDER_SCHEDULES
+
+
+def save_reminder_schedules():
     try:
-        p = Path(REMINDER_FILE)
+        p = Path(REMINDER_SCHEDULE_FILE)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        with p.open("w", encoding="utf-8") as f:
+            json.dump(REMINDER_SCHEDULES, f, ensure_ascii=False, indent=2)
         return True
     except Exception as e:
-        print(f"儲存提醒設定失敗：{e}", flush=True)
+        print(f"提醒設定儲存失敗：{e}", flush=True)
         return False
 
 
-def parse_hhmm(text):
-    m = re.search(r"(\d{1,2})\s*[:：]\s*(\d{2})", str(text or ""))
-    if not m:
+def parse_reminder_command(raw_text):
+    """
+    解析會員提醒指令。
+    回傳：
+    {"action":"set","command":"當沖多","time":"08:50"}
+    {"action":"list"}
+    {"action":"cancel","command":"當沖多"}
+    {"action":"cancel_all"}
+    或 None。
+    """
+    raw = str(raw_text or "").strip()
+    compact = normalize_command_text(raw)
+
+    if compact in ["我的提醒", "提醒列表", "查提醒", "查看提醒", "設定列表"]:
+        return {"action": "list"}
+
+    if compact in ["取消全部提醒", "刪除全部提醒", "關閉全部提醒", "停止全部提醒"]:
+        return {"action": "cancel_all"}
+
+    if "取消提醒" in compact or "刪除提醒" in compact or "停止提醒" in compact or "關閉提醒" in compact:
+        cmd = detect_quantum_command(compact)
+        if cmd:
+            return {"action": "cancel", "command": cmd}
+        return {"action": "cancel_all"}
+
+    # 沒有「提醒 / 定時 / 每天」等關鍵字，就不要誤判一般查詢
+    has_reminder_word = any(w in raw for w in ["提醒", "定時", "每天", "每日", "排程", "鬧鐘"])
+    if not has_reminder_word:
         return None
+
+    # 支援 08:50 / 8:50 / 0850 / 850
+    m = re.search(r"([01]?\d|2[0-3])\s*[:：]?\s*([0-5]\d)", raw)
+    if not m:
+        return {"action": "help"}
 
     hh = int(m.group(1))
     mm = int(m.group(2))
+    time_text = f"{hh:02d}:{mm:02d}"
 
-    if 0 <= hh <= 23 and 0 <= mm <= 59:
-        return f"{hh:02d}:{mm:02d}"
+    cmd = detect_quantum_command(raw)
+    if cmd not in QUANTUM_COMMANDS:
+        return {"action": "help"}
 
-    return None
-
-
-def parse_reminder_target(text):
-    t = normalize_command_text(text)
-    if "全部" in t or "三種" in t or "全選" in t:
-        return "全部"
-    for cmd in REMINDER_COMMAND_LIST:
-        if cmd in t or (cmd == "隔日沖" and "隔日衝" in t):
-            return cmd
-    return None
+    return {"action": "set", "command": cmd, "time": time_text}
 
 
-def list_member_reminders(user_id):
+def format_reminder_help():
+    return """⏰ HCX-AI 會員自訂提醒
+
+你可以設定每天固定時間自動推播：
+
+✅ 設定提醒 當沖多 08:50
+✅ 設定提醒 當沖空 09:00
+✅ 設定提醒 隔日沖 13:35
+✅ 設定提醒 當沖股 08:55
+
+查詢：
+📋 我的提醒
+
+取消：
+🗑️ 取消提醒 當沖多
+🗑️ 取消全部提醒
+
+提醒會在週一到週五觸發。
+⚠️ 若 Render 免費版睡著，需先喚醒服務才會準時。"""
+
+
+def format_user_reminders(user_id):
     with REMINDER_LOCK:
-        data = load_reminder_store()
-        schedules = data.get("schedules", {}).get(user_id, {})
+        user_data = REMINDER_SCHEDULES.get(user_id, {})
 
-    if not schedules:
-        return """⏰ HCX-AI 定時提醒
-
-你目前還沒有設定提醒。
+    if not user_data:
+        return """📋 目前尚未設定提醒
 
 可輸入：
 設定提醒 當沖多 08:50
-設定提醒 當沖空 08:55
-設定提醒 隔日沖 13:35
-設定提醒 全部 08:50
-"""
+設定提醒 當沖空 09:00
+設定提醒 隔日沖 13:35"""
 
     lines = [
-        "⏰ HCX-AI 我的定時提醒",
-        "",
+        "📋 你的 HCX-AI 自動提醒",
+        "━━━━━━━━━━━━━━"
     ]
 
-    for cmd in REMINDER_COMMAND_LIST:
-        if cmd in schedules:
-            lines.append(f"✅ {cmd}：{schedules[cmd]}")
+    for cmd in ["當沖股", "當沖多", "當沖空", "隔日沖"]:
+        item = user_data.get(cmd)
+        if item and item.get("enabled", True):
+            lines.append(f"✅ {cmd}｜每天 {item.get('time', '--:--')}")
 
     lines.extend([
-        "",
-        "修改時間：重新輸入設定提醒即可覆蓋。",
-        "取消單一：取消提醒 當沖多",
-        "取消全部：取消全部提醒",
+        "━━━━━━━━━━━━━━",
+        "取消範例：取消提醒 當沖多"
     ])
 
     return "\n".join(lines)
 
 
-def set_member_reminder(user_id, target, hhmm):
-    targets = REMINDER_COMMAND_LIST if target == "全部" else [target]
+def handle_reminder_command(user_id, parsed):
+    if not user_id:
+        return "⚠️ 無法取得你的 LINE userId，請用一對一好友聊天室設定提醒。"
+
+    action = parsed.get("action")
+
+    if action == "help":
+        return format_reminder_help()
+
+    if action == "list":
+        return format_user_reminders(user_id)
 
     with REMINDER_LOCK:
-        data = load_reminder_store()
-        schedules = data.setdefault("schedules", {})
-        user_sched = schedules.setdefault(user_id, {})
+        if user_id not in REMINDER_SCHEDULES:
+            REMINDER_SCHEDULES[user_id] = {}
 
-        for cmd in targets:
-            if cmd in REMINDER_COMMAND_LIST:
-                user_sched[cmd] = hhmm
+        if action == "set":
+            cmd = parsed["command"]
+            time_text = parsed["time"]
 
-        save_reminder_store(data)
+            REMINDER_SCHEDULES[user_id][cmd] = {
+                "time": time_text,
+                "enabled": True,
+                "last_sent_date": "",
+                "updated_at": query_time_text()
+            }
+            save_reminder_schedules()
 
-    cmd_text = "、".join(targets)
+            return f"""✅ 已設定自動提醒
 
-    return f"""✅ 已設定 HCX-AI 定時提醒
+📌 類型：{cmd}
+⏰ 時間：每天 {time_text}
+📆 週一到週五自動推播
 
-⏰ 時間：{hhmm}
-📌 項目：{cmd_text}
+查詢設定請輸入：
+我的提醒"""
 
-到時間後，我會自動推播量子雷達選股結果給你。
-"""
+        if action == "cancel":
+            cmd = parsed.get("command")
+            if cmd in REMINDER_SCHEDULES.get(user_id, {}):
+                REMINDER_SCHEDULES[user_id].pop(cmd, None)
+                save_reminder_schedules()
+                return f"✅ 已取消「{cmd}」提醒。"
+            return f"目前沒有設定「{cmd}」提醒。"
 
+        if action == "cancel_all":
+            REMINDER_SCHEDULES[user_id] = {}
+            save_reminder_schedules()
+            return "✅ 已取消全部自動提醒。"
 
-def cancel_member_reminder(user_id, target=None):
-    with REMINDER_LOCK:
-        data = load_reminder_store()
-        schedules = data.setdefault("schedules", {})
-        user_sched = schedules.get(user_id, {})
-
-        if not user_sched:
-            return "你目前沒有任何定時提醒。"
-
-        if target is None or target == "全部":
-            schedules[user_id] = {}
-            save_reminder_store(data)
-            return "✅ 已取消全部定時提醒。"
-
-        if target in user_sched:
-            del user_sched[target]
-            save_reminder_store(data)
-            return f"✅ 已取消「{target}」定時提醒。"
-
-        return f"目前沒有設定「{target}」提醒。"
+    return format_reminder_help()
 
 
-def handle_reminder_text(user_id, raw_text):
+def reminder_scheduler_loop():
     """
-    若是提醒相關指令，回傳要回覆的文字。
-    不是提醒指令則回傳 None。
+    背景排程：
+    每 20 秒檢查一次。
+    同一分鐘同一指令若多人訂閱，只掃描一次，再推播給所有會員。
     """
-    text = str(raw_text or "").strip()
-    t = normalize_command_text(text)
-
-    if t in ["我的提醒", "提醒列表", "查看提醒", "定時提醒", "提醒設定"]:
-        return list_member_reminders(user_id)
-
-    if "取消全部提醒" in t or "關閉全部提醒" in t:
-        return cancel_member_reminder(user_id, "全部")
-
-    if "取消提醒" in t or "關閉提醒" in t or "刪除提醒" in t:
-        target = parse_reminder_target(text)
-        if not target:
-            return """請輸入要取消的項目，例如：
-
-取消提醒 當沖多
-取消提醒 當沖空
-取消提醒 隔日沖
-取消全部提醒
-"""
-        return cancel_member_reminder(user_id, target)
-
-    # 設定提醒 當沖多 08:50
-    # 提醒 當沖多 08:50
-    if "提醒" in t and parse_hhmm(text):
-        target = parse_reminder_target(text)
-        hhmm = parse_hhmm(text)
-
-        if not target:
-            return """請輸入要提醒的項目，例如：
-
-設定提醒 當沖多 08:50
-設定提醒 當沖空 08:55
-設定提醒 隔日沖 13:35
-設定提醒 全部 08:50
-"""
-
-        return set_member_reminder(user_id, target, hhmm)
-
-    return None
-
-
-def _run_scheduled_scan_and_push(user_id, command, hhmm):
-    """
-    到點後背景自動掃描並推播。
-    """
-    try:
-        push_text_message(
-            user_id,
-            f"""⏰ HCX-AI 定時提醒
-
-📌 項目：{command}
-🕒 觸發時間：{query_time_text()}
-
-系統正在啟動量子雷達篩選中，稍後自動推播結果。
-"""
-        )
-
-        text = run_quantum_scan(command)
-
-        # 自動提醒標題補強，不暴露內部掃描邏輯
-        text = f"⏰ HCX-AI 定時提醒｜{command}\n" + text
-        push_text_message(user_id, text)
-
-    except Exception as e:
-        traceback.print_exc()
-        try:
-            push_text_message(user_id, f"⚠️ {command} 定時提醒執行失敗：{e}")
-        except Exception:
-            pass
-
-
-def check_and_fire_reminders():
-    """
-    檢查現在是否有到點提醒。
-    回傳本次觸發數量。
-    """
-    now = _tw_now()
-    today = now.strftime("%Y-%m-%d")
-    hhmm_now = now.strftime("%H:%M")
-
-    if reminder_weekdays_only() and not _is_tw_weekday(now):
-        return 0
-
-    due_jobs = []
-
-    with REMINDER_LOCK:
-        data = load_reminder_store()
-        schedules = data.setdefault("schedules", {})
-        last_sent = data.setdefault("last_sent", {})
-
-        for user_id, user_sched in schedules.items():
-            if not isinstance(user_sched, dict):
-                continue
-
-            for command, hhmm in user_sched.items():
-                if command not in REMINDER_COMMAND_LIST:
-                    continue
-                if str(hhmm) != hhmm_now:
-                    continue
-
-                sent_key = f"{user_id}:{command}"
-                if last_sent.get(sent_key) == today:
-                    continue
-
-                # 先記錄，避免同一分鐘被 cron 重複觸發
-                last_sent[sent_key] = today
-                due_jobs.append((user_id, command, hhmm))
-
-        if due_jobs:
-            save_reminder_store(data)
-
-    for user_id, command, hhmm in due_jobs:
-        t = threading.Thread(
-            target=_run_scheduled_scan_and_push,
-            args=(user_id, command, hhmm),
-            daemon=True
-        )
-        t.start()
-
-    return len(due_jobs)
-
-
-def scheduler_loop():
-    """
-    內建背景排程。
-    注意：Render Free 若休眠，背景排程不會跑。
-    所以建議再搭配 /cron 外部每分鐘喚醒。
-    """
-    print("HCX-AI 定時提醒背景排程已啟動", flush=True)
+    print("========== HCX-AI 會員提醒排程已啟動 ==========", flush=True)
+    load_reminder_schedules()
 
     while True:
         try:
-            check_and_fire_reminders()
+            now = taipei_now()
+            today = now.strftime("%Y-%m-%d")
+            hhmm = now.strftime("%H:%M")
+
+            # 台股主要提醒只在週一到週五跑
+            if now.weekday() >= 5:
+                time.sleep(20)
+                continue
+
+            due_map = {}
+
+            with REMINDER_LOCK:
+                for uid, user_data in list(REMINDER_SCHEDULES.items()):
+                    if not isinstance(user_data, dict):
+                        continue
+
+                    for cmd, item in list(user_data.items()):
+                        if not isinstance(item, dict):
+                            continue
+                        if not item.get("enabled", True):
+                            continue
+                        if item.get("time") != hhmm:
+                            continue
+                        if item.get("last_sent_date") == today:
+                            continue
+
+                        item["last_sent_date"] = today
+                        due_map.setdefault(cmd, []).append(uid)
+
+                if due_map:
+                    save_reminder_schedules()
+
+            for cmd, user_ids in due_map.items():
+                try:
+                    print(f"提醒排程觸發：{cmd} {hhmm} 人數={len(user_ids)}", flush=True)
+                    result_text = run_quantum_scan(cmd)
+                    header = f"⏰ HCX-AI 自動提醒｜{cmd}\n🕒 {query_time_text()}\n\n"
+                    final_text = header + result_text
+
+                    for uid in user_ids:
+                        try:
+                            # 若後來被取消會員權限，就不再推播
+                            if is_authorized_user(uid):
+                                push_text_message(uid, final_text[:4900])
+                        except Exception as e:
+                            print(f"提醒推播失敗 {uid}: {e}", flush=True)
+
+                except Exception as e:
+                    print(f"提醒排程掃描失敗 {cmd}: {e}", flush=True)
+                    traceback.print_exc()
+
         except Exception as e:
-            print(f"提醒排程檢查錯誤：{e}", flush=True)
+            print(f"提醒排程主迴圈錯誤：{e}", flush=True)
             traceback.print_exc()
-        time.sleep(30)
+
+        time.sleep(20)
 
 
-def start_internal_scheduler_once():
-    global _SCHEDULER_STARTED
-
-    if _SCHEDULER_STARTED:
+def start_reminder_scheduler():
+    global REMINDER_SCHEDULER_STARTED
+    if REMINDER_SCHEDULER_STARTED:
         return
 
-    enabled = str(os.environ.get("ENABLE_INTERNAL_SCHEDULER", "true")).strip().lower() not in ("0", "false", "no", "off")
-    if not enabled:
-        return
-
-    _SCHEDULER_STARTED = True
-    t = threading.Thread(target=scheduler_loop, daemon=True)
+    REMINDER_SCHEDULER_STARTED = True
+    t = threading.Thread(target=reminder_scheduler_loop, daemon=True)
     t.start()
 
 
@@ -1598,21 +1550,18 @@ def is_common_stock(code, name):
     return True
 
 
+
 def get_quantum_universe():
     """
-    V6.1 B方案候選池：
-    1. 抓官方全市場資料。
-    2. 先排除 ETF / 權證 / 特殊商品。
-    3. 套用當沖量能門檻：
-       - 成交量至少 5000 張
-       - 成交金額至少 100 百萬
-    4. 依成交金額、成交量取前 600 檔。
+    V6.5 候選池：
+    先抓官方全市場資料，排除 ETF / 權證 / 特殊商品。
+    為避免官方資料單位不同造成整批空榜，這裡採「軟性量能排序」：
+    - 有成交量 / 成交金額者優先
+    - 不在這裡硬濾到空
+    - 真正排序與出榜在後面量子雷達分數處理
     """
     meta = fetch_market_meta()
     rows = []
-
-    min_lots = get_quantum_min_volume_lots()
-    min_value_m = get_quantum_min_value_m()
 
     for code, item in meta.items():
         name = clean_text(item.get("名稱") or FALLBACK_STOCK_NAMES.get(code) or code)
@@ -1639,11 +1588,6 @@ def get_quantum_universe():
         vol_lots = volume_shares_to_lots(vol_f)
         value_m = calc_value_m(close_f, vol_f)
 
-        if vol_lots < min_lots:
-            continue
-        if value_m < min_value_m:
-            continue
-
         rows.append({
             "code": code,
             "name": name,
@@ -1657,9 +1601,14 @@ def get_quantum_universe():
 
     rows = sorted(
         rows,
-        key=lambda x: (float(x.get("official_value_m") or 0), float(x.get("volume_lots") or 0)),
+        key=lambda x: (
+            float(x.get("official_value_m") or 0),
+            float(x.get("volume_lots") or 0),
+            float(x.get("close") or 0)
+        ),
         reverse=True
     )
+
     return rows[:get_quantum_scan_limit()]
 
 
@@ -2316,21 +2265,12 @@ def _quantum_daily_swing_score(row, volume_score, value_score):
 
 
 
+
 def apply_hcx_daily_radar_ranking(command, rows):
     """
-    V6.3 正式版：
-    修正 V6.2 過度嚴格造成「當沖多、當沖空、隔日沖」空榜的問題。
-
-    核心比照量子雷達：
-    - 當沖多：多方分數排序
-    - 當沖空：空方分數排序
-    - 隔日沖：隔日沖分數排序
-    - 當沖股：多空綜合挑最好操作
-
-    同時加入每日可出榜：
-    - 先用嚴格門檻。
-    - 若沒有名單，自動改用原始分數排行保底。
-    - 量能先用 5000 張，必要時 fallback 3000 / 1000 張。
+    V6.5：
+    使用量子雷達多方/空方/隔日沖核心分數排序。
+    先嚴格，後保底；避免會員查詢「當沖多、當沖空、隔日沖」都沒有結果。
     """
     if not rows:
         return []
@@ -2350,25 +2290,21 @@ def apply_hcx_daily_radar_ranking(command, rows):
         samples = int(r.get("samples") or 0)
         sample_factor = min(samples / 12, 1.0)
 
-        # 對齊原量子雷達 score_dataframe 權重：
-        # 量能 0.28 + 金額 0.22 + 漲跌幅 0.30 + 收盤位置 0.20
         long_pct_score = _clip_score(max(pct, 0) / 10 * 100)
         short_pct_score = _clip_score(max(-pct, 0) / 10 * 100)
-        long_pos_score = pos20
-        short_pos_score = 100 - pos20
 
         long_score = (
             float(volume_score) * 0.28 +
             float(value_score) * 0.22 +
             long_pct_score * 0.30 +
-            long_pos_score * 0.20
+            pos20 * 0.20
         )
 
         short_score = (
             float(volume_score) * 0.28 +
             float(value_score) * 0.22 +
             short_pct_score * 0.30 +
-            short_pos_score * 0.20
+            (100 - pos20) * 0.20
         )
 
         swing_score = _quantum_daily_swing_score(r, volume_score, value_score)
@@ -2390,24 +2326,21 @@ def apply_hcx_daily_radar_ranking(command, rows):
             rr["rank_score"] = round(pro_long, 1)
             rr["trade_kind"] = "intraday_long"
             rr["signal"] = "🟥 偏多當沖"
-            # 嚴格條件：強勢收盤 + 多方分數夠高
-            rr["_strict_keep"] = (long_score >= 60 and pct >= -1.5 and pos20 >= 50 and oper >= 40)
+            rr["_strict_keep"] = (long_score >= 55 and pct >= -2.5 and pos20 >= 40 and oper >= 30)
 
         elif command == "當沖空":
             rr["score"] = round(short_score, 1)
             rr["rank_score"] = round(pro_short, 1)
             rr["trade_kind"] = "intraday_short"
             rr["signal"] = "🟩 偏空當沖"
-            # 嚴格條件：弱勢收盤 + 空方分數夠高
-            rr["_strict_keep"] = (short_score >= 60 and pct <= 1.5 and pos20 <= 50 and oper >= 40)
+            rr["_strict_keep"] = (short_score >= 55 and pct <= 2.5 and pos20 <= 60 and oper >= 30)
 
         elif command == "隔日沖":
             rr["score"] = round(swing_score, 1)
             rr["rank_score"] = round(pro_swing, 1)
             rr["trade_kind"] = "swing"
             rr["signal"] = "🟧 隔日沖觀察"
-            # 嚴格條件放寬：沿用原量子雷達每日可出榜精神
-            rr["_strict_keep"] = (swing_score >= 58 and pct >= -2.5 and pos20 >= 35 and oper >= 35)
+            rr["_strict_keep"] = (swing_score >= 50 and oper >= 25)
 
         elif command == "當沖股":
             if long_score >= short_score:
@@ -2415,13 +2348,13 @@ def apply_hcx_daily_radar_ranking(command, rows):
                 rr["rank_score"] = round(pro_long, 1)
                 rr["trade_kind"] = "intraday_long"
                 rr["signal"] = "🟥 偏多當沖"
-                rr["_strict_keep"] = (long_score >= 58 and pct >= -2.0 and pos20 >= 45 and oper >= 38)
+                rr["_strict_keep"] = (long_score >= 52 and oper >= 25)
             else:
                 rr["score"] = round(short_score, 1)
                 rr["rank_score"] = round(pro_short, 1)
                 rr["trade_kind"] = "intraday_short"
                 rr["signal"] = "🟩 偏空當沖"
-                rr["_strict_keep"] = (short_score >= 58 and pct <= 2.0 and pos20 <= 55 and oper >= 38)
+                rr["_strict_keep"] = (short_score >= 52 and oper >= 25)
         else:
             continue
 
@@ -2435,38 +2368,171 @@ def apply_hcx_daily_radar_ranking(command, rows):
             float(x.get("volume_lots") or 0),
         )
 
-    min_value_m = get_quantum_min_value_m()
     top_n = get_quantum_top_n()
 
-    # 第一段：照嚴格條件出榜
-    for min_lots in get_quantum_volume_fallback_levels():
-        strict = [
-            r for r in scored
-            if r.get("_strict_keep")
-            and float(r.get("volume_lots") or 0) >= min_lots
-            and float(r.get("value_m") or 0) >= min_value_m
-        ]
-        strict = sorted(strict, key=_sort_key, reverse=True)
-        if len(strict) >= top_n:
-            return strict[:get_quantum_deep_limit()]
-        if strict and not get_quantum_daily_list_mode():
-            return strict[:get_quantum_deep_limit()]
+    # 第一層：嚴格條件
+    strict = [r for r in scored if r.get("_strict_keep")]
+    strict = sorted(strict, key=_sort_key, reverse=True)
+    if len(strict) >= top_n:
+        return strict[:get_quantum_deep_limit()]
 
-    # 第二段：每日可出榜保底
-    # 不再硬卡 pct / pos20，只用原始量子分數 + 流動性排序，避免整個指令空榜。
-    if get_quantum_daily_list_mode():
-        for min_lots in get_quantum_volume_fallback_levels():
-            loose = [
-                r for r in scored
-                if float(r.get("volume_lots") or 0) >= min_lots
-                and float(r.get("value_m") or 0) >= min_value_m
-                and float(r.get("score") or 0) >= 35
-            ]
-            loose = sorted(loose, key=_sort_key, reverse=True)
-            if loose:
-                return loose[:get_quantum_deep_limit()]
+    # 第二層：每日可出榜保底
+    loose = [r for r in scored if float(r.get("score") or 0) >= 20]
+    loose = sorted(loose, key=_sort_key, reverse=True)
+    return loose[:get_quantum_deep_limit()]
 
-    return []
+
+def format_quantum_top_report(command, rows):
+    title_map = {
+        "當沖多": "🔴 當沖多 TOP 5｜職業操盤精選",
+        "當沖空": "🟢 當沖空 TOP 5｜職業操盤精選",
+        "隔日沖": "🟠 隔日沖 TOP 5｜選股日報精選",
+        "當沖股": "⚡ 最佳當沖股 TOP 5｜多空綜合精選",
+    }
+
+    if not rows:
+        return f"""⚡ HCX-AI量子雷達
+🕒 查詢時間：{query_time_text()}
+📌 指令：{command}
+
+本次暫無適合出手的股票。
+可稍後盤中再查，或等待量能與方向更明確。
+"""
+
+    lines = [
+        "⚡ HCX-AI量子雷達",
+        f"🕒 查詢時間：{query_time_text()}",
+        f"{title_map.get(command, command)}",
+        "━━━━━━━━━━━━━━",
+    ]
+
+    for idx, r in enumerate(rows[:get_quantum_top_n()], 1):
+        direction = r.get("signal", "職業當沖觀察")
+        lines.append(
+            f"{idx}. {r['code']} {r['name']}｜{direction}\n"
+            f"   收盤 {fmt_price(r['close'])}｜漲跌 {r['pct']:+.2f}%｜量比 {r['vol_ratio']:.2f}\n"
+            f"   🏆 AI勝率 {r['win_rate']:.1f}%｜樣本 {r['samples']}｜職業評分 {r['rank_score']:.1f}\n"
+            f"   🎯 建議進場價：{fmt_price(r['entry'])}\n"
+            f"   ✅ 建議停利價：{fmt_price(r['take_profit'])}\n"
+            f"   🛑 建議停損價：{fmt_price(r['stop'])}\n"
+            f"{format_tick_profit_line(r)}"
+        )
+
+    lines.extend([
+        "━━━━━━━━━━━━━━",
+        "⚠️ 此為HCX-AI量子雷達篩選結果，不保證獲利。",
+        "⚠️ 當沖實戰請搭配1分K轉折、量能與停損紀律。",
+    ])
+
+    text = "\n".join(lines)
+    return text[:4800]
+
+
+def get_quantum_workers():
+    """
+    Render 免費機不要開太大，避免 yfinance 擋流量或 CPU 爆掉。
+    """
+    try:
+        n = int(os.environ.get("QUANTUM_WORKERS", "6"))
+        return max(3, min(n, 8))
+    except Exception:
+        return 6
+
+
+def build_official_fallback_metrics(item, kind):
+    """
+    官方資料保底：
+    如果 yfinance / TWSE 月線資料暫時失敗，不要整個指令空榜。
+    以官方收盤與成交量做簡易估算，讓每日提醒至少能出榜。
+    """
+    code = item.get("code")
+    close = float(item.get("close") or 0)
+    volume = float(item.get("volume") or 0)
+    volume_lots = float(item.get("volume_lots") or 0)
+    value_m = float(item.get("official_value_m") or 0)
+    t = tick_size(close)
+
+    if close <= 0:
+        return None
+
+    high20 = close * 1.035
+    low20 = close * 0.965
+    atr = max(close * 0.025, t * 3)
+    pct = 0.0
+    pos20 = 50.0
+    vol_ratio = 1.0 if volume_lots > 0 else 0.5
+
+    win_rate = 50.0
+    samples = 0
+
+    return {
+        "close": close,
+        "pct": pct,
+        "volume": volume,
+        "volume_lots": volume_lots,
+        "value_m": value_m,
+        "day_high": close,
+        "day_low": close,
+        "amplitude": 2.5,
+        "ma5": close,
+        "ma10": close,
+        "ma20": close,
+        "ma60": close,
+        "pos20": pos20,
+        "vol_ratio": vol_ratio,
+        "atr": atr,
+        "high20": high20,
+        "low20": low20,
+        "win_rate": win_rate,
+        "samples": samples,
+        "score": 0.0,
+        "rank_score": 0.0,
+        "entry": None,
+        "take_profit": None,
+        "stop": None,
+        "basis": "",
+        "signal": "職業當沖觀察",
+        "trade_kind": kind,
+    }
+
+
+def process_quantum_item(item, kind):
+    """
+    單檔日K整理，供 ThreadPoolExecutor 並行使用。
+    V6.5 修正：若下載日K失敗，改用官方資料保底，不讓三個指令全部空榜。
+    """
+    code = item["code"]
+    meta = get_stock_meta(code)
+
+    try:
+        df, source = get_stock_data(code, meta["market"])
+    except Exception as e:
+        print(f"日K下載失敗 {code}: {e}", flush=True)
+        df, source = None, None
+
+    if df is not None and not df.empty and len(df) >= 60:
+        metrics = score_quantum_candidate(df, kind, code=code, market=meta["market"])
+    else:
+        metrics = build_official_fallback_metrics(item, kind)
+        if metrics is None:
+            return None
+
+    # 與官方初選資料合併，避免 yfinance volume 偶發缺值
+    official_lots = float(item.get("volume_lots") or 0)
+    official_value_m = float(item.get("official_value_m") or 0)
+    metrics["volume_lots"] = max(float(metrics.get("volume_lots") or 0), official_lots)
+    metrics["value_m"] = max(float(metrics.get("value_m") or 0), official_value_m)
+
+    if metrics.get("close", 0) < 5:
+        return None
+
+    return {
+        "code": code,
+        "name": meta["name"],
+        "market": meta["market"],
+        **metrics,
+    }
+
 
 
 def attach_trade_plan_to_top_rows(rows, kind):
@@ -2519,10 +2585,17 @@ def run_quantum_scan(command):
                 print(f"量子並行掃描略過：{e}", flush=True)
                 continue
 
-    # 第二層：100 → 30
+    # 若日K下載全部失敗，改用官方資料保底，避免空榜
+    if not results:
+        for item in universe100[:get_quantum_stage1_limit()]:
+            r = process_quantum_item(item, kind)
+            if r is not None:
+                results.append(r)
+
+    # 第二層：量子雷達分數排序
     results = apply_hcx_daily_radar_ranking(command, results)
 
-    # 第三層：30 → TOP5，只對TOP5補分K進場/停利/停損與Tick成本提醒
+    # 第三層：TOP5 補分K進場/停利/停損與Tick提醒
     results = attach_trade_plan_to_top_rows(results, kind)
     return format_quantum_top_report(command, results)
 
@@ -2542,6 +2615,7 @@ def run_quantum_scan_and_push(user_id, command):
             pass
 
 
+
 def start_quantum_scan(user_id, command):
     """
     LINE Reply Token 有時間限制，所以先回覆「已開始掃描」，
@@ -2556,34 +2630,13 @@ def start_quantum_scan(user_id, command):
 
     return f"""⚡ 已收到「{command}」指令
 
-系統正在啟動HCX-AI量子雷達篩選中...
+系統正在啟動 HCX-AI 量子雷達篩選中...
 
 📊 掃描模式：選股日報核心 TOP 5
 🕒 查詢時間：{query_time_text()}
 
 稍後會自動推播結果給你。
 """
-
-
-@app.route("/cron")
-def cron_trigger():
-    """
-    外部 cron 喚醒用。
-    建議 cron-job.org / UptimeRobot 每分鐘打一次：
-    https://你的服務.onrender.com/cron
-
-    若 Render Environment 有設定：
-    CRON_SECRET=你自訂密碼
-
-    則網址要改：
-    https://你的服務.onrender.com/cron?key=你自訂密碼
-    """
-    secret = os.environ.get("CRON_SECRET", "").strip()
-    if secret and request.args.get("key", "") != secret:
-        return "Forbidden", 403
-
-    count = check_and_fire_reminders()
-    return f"OK｜{query_time_text()}｜due={count}"
 
 
 @app.route("/")
@@ -2623,10 +2676,12 @@ def handle_message(event):
     raw_msg = event.message.text.strip()
     msg = raw_msg.replace("\n", "").replace("/", "").replace("股票", "").strip()
     quantum_command = detect_quantum_command(raw_msg)
+    reminder_command = parse_reminder_command(raw_msg)
 
     print(f"來源類型 source_type={source_type}", flush=True)
     print(f"使用者 user_id={user_id}", flush=True)
     print(f"量子指令 quantum_command={quantum_command}", flush=True)
+    print(f"提醒指令 reminder_command={reminder_command}", flush=True)
 
     # 支援：2330、/2330、股票2330、請查2330
     match = re.search(r"(\d{4})", msg)
@@ -2677,23 +2732,17 @@ def handle_message(event):
             elif not is_authorized_user(user_id):
                 reply = member_block_message(user_id)
 
+            elif reminder_command:
+                reply = handle_reminder_command(user_id, reminder_command)
+
+            elif quantum_command in QUANTUM_COMMANDS:
+                reply = start_quantum_scan(user_id, quantum_command)
+
+            elif match:
+                code = match.group(1)
+                reply = stock_ai(code)
+
             else:
-                reminder_reply = handle_reminder_text(user_id, raw_msg)
-
-                if reminder_reply:
-                    reply = reminder_reply
-
-                elif quantum_command in QUANTUM_COMMANDS:
-                    reply = start_quantum_scan(user_id, quantum_command)
-
-                elif match:
-                    code = match.group(1)
-                    reply = stock_ai(code)
-
-                else:
-                    reply = None
-
-            if reply is None:
                 reply = f"""🌈 HCX AI 股票分析師
 
 請輸入 4 碼股票代號，例如：
@@ -2720,46 +2769,12 @@ def handle_message(event):
 🟢 輸入「當沖空」：列出當沖空 TOP 5
 🟠 輸入「隔日沖」：列出隔日沖 TOP 5
 
-定時提醒指令：
+自動提醒指令：
 ⏰ 設定提醒 當沖多 08:50
-⏰ 設定提醒 當沖空 08:55
+⏰ 設定提醒 當沖空 09:00
 ⏰ 設定提醒 隔日沖 13:35
-⏰ 設定提醒 全部 08:50
-⏰ 我的提醒
-⏰ 取消提醒 當沖多
-⏰ 取消全部提醒
-
-指令：
-輸入「版本」可確認目前是否已部署最新版。
-輸入「我的ID」可取得會員開通用 ID。
-"""
-
-            else:
-                reply = f"""🌈 HCX AI 股票分析師
-
-請輸入 4 碼股票代號，例如：
-
-🚀 2330 台積電
-⚡ 2454 聯發科
-🏭 2317 鴻海
-🧪 1717 長興
-
-我會幫你分析：
-✅ 股票名稱
-✅ 現價與漲跌幅
-✅ 均線趨勢
-✅ 主力成本估算
-✅ 支撐壓力
-✅ 做多價位
-✅ 做空價位
-✅ 停損點
-✅ 目標價
-
-量子選股指令：
-⚡ 輸入「當沖股」：列出最好操作的當沖股 TOP 5
-🔴 輸入「當沖多」：列出當沖多 TOP 5
-🟢 輸入「當沖空」：列出當沖空 TOP 5
-🟠 輸入「隔日沖」：列出隔日沖 TOP 5
+📋 我的提醒
+🗑️ 取消提醒 當沖多
 
 也支援：
 /當沖股、今日當沖、最佳當沖、當沖
@@ -2791,7 +2806,8 @@ def handle_message(event):
         traceback.print_exc()
 
 
-start_internal_scheduler_once()
+# 啟動會員提醒排程
+start_reminder_scheduler()
 
 
 if __name__ == "__main__":
