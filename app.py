@@ -21,6 +21,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from io import StringIO
+from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
@@ -37,7 +38,7 @@ import requests
 # 4. 加入做多 / 做空價位說明
 # ============================================================
 
-APP_VERSION = "V6.5 正式版｜修正空榜＋會員提醒＋隱藏內部篩選"
+APP_VERSION = "V6.5.1 正式版｜修正提醒排程Path錯誤"
 
 app = Flask(__name__)
 
