@@ -35,7 +35,7 @@ import requests
 # 4. 加入做多 / 做空價位說明
 # ============================================================
 
-APP_VERSION = "V5.5 會員限定版｜量子選股指令＋當沖多空＋隔日沖TOP10"
+APP_VERSION = "V5.5.1 會員限定版｜量子指令辨識強化＋當沖多空＋隔日沖TOP10"
 
 app = Flask(__name__)
 
@@ -965,6 +965,49 @@ QUANTUM_COMMANDS = {
     "隔日沖": "swing",
 }
 
+def normalize_command_text(text):
+    """
+    將使用者輸入標準化，避免多一個空白、斜線、標點就辨識不到。
+    支援：
+    當沖多、/當沖多、當沖 多、我要當沖多、當衝多
+    當沖空、/當沖空、當沖 空、我要當沖空、當衝空
+    隔日沖、隔日衝、/隔日沖
+    """
+    text = str(text or "").strip()
+    text = text.replace("\n", "")
+    text = text.replace(" ", "")
+    text = text.replace("　", "")
+    text = text.replace("/", "")
+    text = text.replace("股票", "")
+    text = text.replace("請查", "")
+    text = text.replace("查詢", "")
+    text = text.replace("我要", "")
+    text = text.replace("幫我", "")
+    text = text.replace("一下", "")
+    return text
+
+
+def detect_quantum_command(raw_text):
+    """
+    回傳標準指令：當沖多 / 當沖空 / 隔日沖
+    找不到則回傳 None。
+    """
+    t = normalize_command_text(raw_text)
+
+    long_words = ["當沖多", "當衝多", "沖多", "衝多", "當日多", "當沖做多", "當衝做多"]
+    short_words = ["當沖空", "當衝空", "沖空", "衝空", "當日空", "當沖做空", "當衝做空"]
+    swing_words = ["隔日沖", "隔日衝", "隔日", "隔日多", "隔日沖多", "隔日衝多"]
+
+    if any(w in t for w in long_words):
+        return "當沖多"
+    if any(w in t for w in short_words):
+        return "當沖空"
+    if any(w in t for w in swing_words):
+        return "隔日沖"
+
+    return None
+
+
 
 def push_text_message(user_id, text):
     """背景掃描完成後，主動推送結果給查詢者。"""
@@ -1431,9 +1474,11 @@ def handle_message(event):
 
     raw_msg = event.message.text.strip()
     msg = raw_msg.replace("\n", "").replace("/", "").replace("股票", "").strip()
+    quantum_command = detect_quantum_command(raw_msg)
 
     print(f"來源類型 source_type={source_type}", flush=True)
     print(f"使用者 user_id={user_id}", flush=True)
+    print(f"量子指令 quantum_command={quantum_command}", flush=True)
 
     # 支援：2330、/2330、股票2330、請查2330
     match = re.search(r"(\d{4})", msg)
@@ -1484,8 +1529,8 @@ def handle_message(event):
             elif not is_authorized_user(user_id):
                 reply = member_block_message(user_id)
 
-            elif msg in QUANTUM_COMMANDS:
-                reply = start_quantum_scan(user_id, msg)
+            elif quantum_command in QUANTUM_COMMANDS:
+                reply = start_quantum_scan(user_id, quantum_command)
 
             elif match:
                 code = match.group(1)
@@ -1516,6 +1561,11 @@ def handle_message(event):
 🔴 輸入「當沖多」：列出當沖多 TOP 10
 🟢 輸入「當沖空」：列出當沖空 TOP 10
 🟠 輸入「隔日沖」：列出隔日沖 TOP 10
+
+也支援：
+/當沖多、當沖 多、當衝多、我要當沖多
+/當沖空、當沖 空、當衝空、我要當沖空
+/隔日沖、隔日衝
 
 指令：
 輸入「版本」可確認目前是否已部署最新版。
