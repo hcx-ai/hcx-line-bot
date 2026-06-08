@@ -36,7 +36,7 @@ import requests
 # 4. 加入做多 / 做空價位說明
 # ============================================================
 
-APP_VERSION = "V5.9 會員限定版｜選股日報核心＋職業當沖TOP5"
+APP_VERSION = "V6.0 會員限定版｜600檔量子篩選＋Tick成本獲利提醒"
 
 app = Flask(__name__)
 
@@ -603,6 +603,88 @@ def fmt_pct(x):
         return "-"
 
 
+def calc_daytrade_tick_profit(price):
+    """
+    台股當沖 Tick 成本/獲利提醒。
+    採最嚴格的手續費6折估算：
+    - 買進手續費：0.1425% * 0.6
+    - 賣出手續費：0.1425% * 0.6
+    - 當沖證交稅：0.15%
+    合計成本比例約 0.321%。
+    """
+    try:
+        price = float(price)
+        t = tick_size(price)
+
+        fee_rate = 0.001425 * 0.6
+        tax_rate = 0.0015
+        shares = 1000
+
+        buy_fee = price * shares * fee_rate
+        sell_fee = price * shares * fee_rate
+        tax_fee = price * shares * tax_rate
+        total_cost = buy_fee + sell_fee + tax_fee
+
+        tick_profit = t * shares
+        break_even_ticks = max(1, math.ceil(total_cost / tick_profit)) if tick_profit > 0 else 1
+        first_profit_ticks = break_even_ticks
+
+        return {
+            "tick": t,
+            "cost": total_cost,
+            "tick_profit": tick_profit,
+            "break_even_ticks": break_even_ticks,
+            "first_profit_ticks": first_profit_ticks,
+            "cost_rate_pct": (fee_rate * 2 + tax_rate) * 100,
+        }
+    except Exception:
+        return {
+            "tick": 0,
+            "cost": 0,
+            "tick_profit": 0,
+            "break_even_ticks": 1,
+            "first_profit_ticks": 1,
+            "cost_rate_pct": 0.321,
+        }
+
+
+def calc_plan_profit_ticks(entry, take_profit, kind):
+    """
+    計算建議停利價距離進場價大約幾個 Tick。
+    """
+    try:
+        entry = float(entry)
+        take_profit = float(take_profit)
+        t = tick_size(entry)
+        if t <= 0:
+            return 0
+        if kind == "intraday_short":
+            return max(0, int(round((entry - take_profit) / t)))
+        return max(0, int(round((take_profit - entry) / t)))
+    except Exception:
+        return 0
+
+
+def format_tick_profit_line(row):
+    """
+    給LINE會員看的簡潔成本提醒。
+    不揭露完整算法，只顯示每張成本、1 Tick 獲利與幾 Tick 回本。
+    """
+    close = float(row.get("close") or row.get("entry") or 0)
+    entry = float(row.get("entry") or close)
+    take_profit = float(row.get("take_profit") or entry)
+    kind = row.get("trade_kind") or "intraday_long"
+
+    info = calc_daytrade_tick_profit(close)
+    plan_ticks = calc_plan_profit_ticks(entry, take_profit, kind)
+
+    msg = (
+        f"   💰 成本約 {info['cost']:.0f}元/張｜1 Tick約 {info['tick_profit']:.0f}元\n"
+        f"   🔥 回本門檻：{info['break_even_ticks']} Tick｜建議停利約 {plan_ticks} Tick"
+    )
+    return msg
+
+
 def data_date_text(df):
     """
     顯示最後一根日K的日期，也就是本次分析採用的資料日。
@@ -940,7 +1022,7 @@ def stock_ai(code):
 ━━━━━━━━━━━━━━
 ⚠️ 風險提醒
 本訊息為程式估算與技術分析，不代表保證獲利。
-主力成本為5/10/20日VWAP與大量成交區加權估算，非券商實際持股成本。
+主力成本為AI估算值，非券商實際持股成本。
 """
 
     except Exception as e:
@@ -1031,15 +1113,38 @@ def push_text_message(user_id, text):
 
 def get_quantum_scan_limit():
     """
-    量子選股只搜尋前30名活躍股。
-    若 Render Environment Variable 有設定 QUANTUM_SCAN_LIMIT，仍以30為上限。
+    B方案：先用全市場活躍股 600 檔做母體。
+    Render Environment Variable 可設定 QUANTUM_SCAN_LIMIT，但上限固定 600。
     """
     try:
-        n = int(os.environ.get("QUANTUM_SCAN_LIMIT", "30"))
-        return max(10, min(n, 30))
+        n = int(os.environ.get("QUANTUM_SCAN_LIMIT", "600"))
+        return max(100, min(n, 600))
+    except Exception:
+        return 600
+
+
+def get_quantum_stage1_limit():
+    """
+    第一層快速篩選：600檔 → 100檔。
+    先用官方成交量/成交值做快速初選，避免600檔全部下載日K造成LINE等待太久。
+    """
+    try:
+        n = int(os.environ.get("QUANTUM_STAGE1_LIMIT", "100"))
+        return max(30, min(n, 150))
+    except Exception:
+        return 100
+
+
+def get_quantum_deep_limit():
+    """
+    第二層深度評分：100檔 → 30檔。
+    只有前30名才進入最後分K價位計算。
+    """
+    try:
+        n = int(os.environ.get("QUANTUM_DEEP_LIMIT", "30"))
+        return max(10, min(n, 50))
     except Exception:
         return 30
-
 
 
 def get_quantum_top_n():
@@ -1079,8 +1184,10 @@ def is_common_stock(code, name):
 
 def get_quantum_universe():
     """
-    取得量子掃描候選池。
-    以官方全市場快取為主，依成交量排序取前 N 檔。
+    B方案候選池：
+    先抓全市場官方資料，依成交量/成交值排序取 600 檔。
+    後續 run_quantum_scan 會再做：
+    600 → 100 → 30 → 5
     """
     meta = fetch_market_meta()
     rows = []
@@ -1094,24 +1201,57 @@ def get_quantum_universe():
         if not is_common_stock(code, name):
             continue
 
-        # 價格過低或缺資料的先略過；避免掃到冷門或異常資料
-        if close is not None:
-            try:
-                if float(close) < 5:
-                    continue
-            except Exception:
-                pass
+        try:
+            close_f = float(close or 0)
+        except Exception:
+            close_f = 0.0
+
+        try:
+            vol_f = float(vol or 0)
+        except Exception:
+            vol_f = 0.0
+
+        if close_f > 0 and close_f < 5:
+            continue
+
+        value_score = close_f * vol_f
 
         rows.append({
             "code": code,
             "name": name,
             "market": market,
-            "close": close if close is not None else 0,
-            "volume": vol if vol is not None else 0,
+            "close": close_f,
+            "volume": vol_f,
+            "official_value": value_score,
         })
 
-    rows = sorted(rows, key=lambda x: float(x.get("volume") or 0), reverse=True)
+    rows = sorted(
+        rows,
+        key=lambda x: (float(x.get("official_value") or 0), float(x.get("volume") or 0)),
+        reverse=True
+    )
     return rows[:get_quantum_scan_limit()]
+
+
+def select_stage1_candidates(universe, command):
+    """
+    第一層：600 → 100。
+    用官方成交量/成交值快速篩選，讓搜尋範圍夠大，但不會慢到會員等太久。
+    """
+    if not universe:
+        return []
+
+    limit = get_quantum_stage1_limit()
+
+    # 當沖多/空/股：優先成交值與成交量，避免冷門股。
+    # 隔日沖：同樣保留成交值，避免隔日流動性不足。
+    ranked = sorted(
+        universe,
+        key=lambda x: (float(x.get("official_value") or 0), float(x.get("volume") or 0)),
+        reverse=True
+    )
+
+    return ranked[:limit]
 
 
 def calc_atr14(high_series, low_series, close_series):
@@ -1778,7 +1918,7 @@ def apply_hcx_daily_radar_ranking(command, rows):
     ranked = sorted(ranked, key=lambda x: (x["rank_score"], x.get("win_rate", 0), x.get("value_m", 0)), reverse=True)
     if not ranked:
         ranked = sorted(rows, key=lambda x: (x.get("rank_score", 0), x.get("win_rate", 0)), reverse=True)
-    return ranked[:get_quantum_top_n()]
+    return ranked[:get_quantum_deep_limit()]
 
 def format_quantum_top_report(command, rows):
     title_map = {
@@ -1801,7 +1941,7 @@ def format_quantum_top_report(command, rows):
         "⚡ HCX-AI量子雷達",
         f"🕒 查詢時間：{query_time_text()}",
         f"{title_map.get(command, command)}",
-        "📦 搜尋範圍：活躍股前30名｜職業當沖精選｜只列前5名",
+        "📦 搜尋範圍：600檔 → 100 → 30 → TOP5",
         "━━━━━━━━━━━━━━",
     ]
 
@@ -1813,7 +1953,8 @@ def format_quantum_top_report(command, rows):
             f"   🏆 AI勝率 {r['win_rate']:.1f}%｜樣本 {r['samples']}｜職業評分 {r['rank_score']:.1f}\n"
             f"   🎯 建議進場價：{fmt_price(r['entry'])}\n"
             f"   ✅ 建議停利價：{fmt_price(r['take_profit'])}\n"
-            f"   🛑 建議停損價：{fmt_price(r['stop'])}"
+            f"   🛑 建議停損價：{fmt_price(r['stop'])}\n"
+            f"{format_tick_profit_line(r)}"
         )
 
     lines.extend([
@@ -1929,12 +2070,15 @@ def run_quantum_scan(command):
     if not kind:
         return "指令錯誤，請輸入：當沖股、當沖多、當沖空、隔日沖"
 
-    universe = get_quantum_universe()
+    # B方案：600 → 100 → 30 → 5
+    universe600 = get_quantum_universe()
+    universe100 = select_stage1_candidates(universe600, command)
+
     results = []
 
     workers = get_quantum_workers()
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(process_quantum_item, item, kind) for item in universe]
+        futures = [executor.submit(process_quantum_item, item, kind) for item in universe100]
         for fut in as_completed(futures):
             try:
                 r = fut.result()
@@ -1944,10 +2088,10 @@ def run_quantum_scan(command):
                 print(f"量子並行掃描略過：{e}", flush=True)
                 continue
 
-    # V5.9：依照黑暗量子選股日報的橫向分數精神，重新排序選出前5名。
+    # 第二層：100 → 30
     results = apply_hcx_daily_radar_ranking(command, results)
 
-    # 只對前5名補分K進場/停利/停損，維持速度。
+    # 第三層：30 → TOP5，只對TOP5補分K進場/停利/停損與Tick成本提醒
     results = attach_trade_plan_to_top_rows(results, kind)
     return format_quantum_top_report(command, results)
 
@@ -1981,10 +2125,10 @@ def start_quantum_scan(user_id, command):
 
     return f"""⚡ 已收到「{command}」指令
 
-系統正在啟動HCX-AI量子雷達極速掃描中...
+系統正在啟動HCX-AI量子雷達600檔篩選中...
 
 📊 掃描模式：選股日報核心 TOP 5
-📦 搜尋範圍：活躍股前30名｜職業當沖精選
+📦 搜尋範圍：600檔 → 100 → 30 → TOP5
 🕒 查詢時間：{query_time_text()}
 
 稍後會自動推播結果給你。
