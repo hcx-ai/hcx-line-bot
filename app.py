@@ -41,7 +41,7 @@ except Exception:
 
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-APP_VERSION = "V7.3 穩定版｜13點隔日沖＋兩排觸控選單"
+APP_VERSION = "V7.4 穩定版｜八宮格快捷鍵＋13點隔日沖"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
@@ -159,19 +159,19 @@ def calc_tick_profit_info(entry, take_profit):
 
 def build_quick_reply():
     """
-    LINE Quick Reply 原生是橫向滑動，不能強制做成上下兩排。
-    所以這裡只保留 4 顆常用提醒按鈕，避免會員還要往右滑。
-    真正上下兩排按鈕由「主選單」Flex Menu 提供。
+    LINE 底部 Quick Reply 原生是橫向滑動。
+    這裡只保留最常用 4 顆，完整 8 宮格請點「主選單」。
     """
     if not HAS_QUICK_REPLY:
         return None
     labels = [
-        ("我的提醒", "我的提醒"),
-        ("08:50當沖多", "設定提醒 當沖多 08:50"),
-        ("09:00當沖空", "設定提醒 當沖空 09:00"),
-        ("13:00隔日沖", "設定提醒 隔日沖 13:00"),
+        ("主選單", "主選單"),
+        ("08:50沖多", "設定提醒 當沖多 08:50"),
+        ("09:00沖空", "設定提醒 當沖空 09:00"),
+        ("13:00隔沖", "設定提醒 隔日沖 13:00"),
     ]
     return QuickReply(items=[QuickReplyItem(action=MessageAction(label=a, text=b)) for a, b in labels])
+
 
 
 def _flex_button(label, text, style="secondary"):
@@ -184,9 +184,23 @@ def _flex_button(label, text, style="secondary"):
 
 
 def build_main_menu_flex():
-    """兩排觸控式選單，避免 Quick Reply 需要左右滑動。"""
+    """
+    V7.4 八宮格快捷鍵：
+    改成 2 欄 x 4 列，手機上文字比較不會被縮成「...」。
+    """
     if not HAS_FLEX_MENU:
         return None
+
+    def _row(left_label, left_text, right_label, right_text, left_style="secondary", right_style="secondary"):
+        return {
+            "type": "box",
+            "layout": "horizontal",
+            "spacing": "sm",
+            "contents": [
+                _flex_button(left_label, left_text, left_style),
+                _flex_button(right_label, right_text, right_style),
+            ],
+        }
 
     bubble = {
         "type": "bubble",
@@ -198,40 +212,23 @@ def build_main_menu_flex():
             "contents": [
                 {"type": "text", "text": "⚡ HCX-AI 量子雷達", "weight": "bold", "size": "lg"},
                 {"type": "text", "text": "請直接點選下方功能", "size": "sm", "color": "#666666"},
-                {
-                    "type": "box",
-                    "layout": "horizontal",
-                    "spacing": "sm",
-                    "contents": [
-                        _flex_button("當沖股", "當沖股", "primary"),
-                        _flex_button("當沖多", "當沖多", "primary"),
-                        _flex_button("當沖空", "當沖空", "primary"),
-                        _flex_button("隔日沖", "隔日沖", "primary"),
-                    ],
-                },
-                {
-                    "type": "box",
-                    "layout": "horizontal",
-                    "spacing": "sm",
-                    "contents": [
-                        _flex_button("我的提醒", "我的提醒"),
-                        _flex_button("08:50沖多", "設定提醒 當沖多 08:50"),
-                        _flex_button("09:00沖空", "設定提醒 當沖空 09:00"),
-                        _flex_button("13:00隔沖", "設定提醒 隔日沖 13:00"),
-                    ],
-                },
+                _row("版本號", "版本", "當沖多", "當沖多", "secondary", "primary"),
+                _row("當沖空", "當沖空", "隔日沖", "隔日沖", "primary", "primary"),
+                _row("台積電", "2330", "提醒多", "設定提醒 當沖多 08:50"),
+                _row("提醒空", "設定提醒 當沖空 09:00", "提醒隔", "設定提醒 隔日沖 13:00"),
                 {"type": "text", "text": "也可輸入：請開機、版本、股票代號", "size": "xs", "color": "#888888", "wrap": True},
             ],
         },
     }
     try:
         return FlexMessage(
-            alt_text="HCX-AI 主選單",
+            alt_text="HCX-AI 八宮格快捷鍵",
             contents=FlexContainer.from_json(json.dumps(bubble, ensure_ascii=False)),
         )
     except Exception as e:
         print(f"Flex選單建立失敗：{e}", flush=True)
         return None
+
 
 
 def reply_main_menu(reply_token):
