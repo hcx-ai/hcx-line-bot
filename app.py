@@ -41,7 +41,7 @@ except Exception:
 
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-APP_VERSION = "V7.5.1 穩定版｜九宮格小鈴鐺＋波段股＋布林通道"
+APP_VERSION = "V7.5.2 穩定版"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
@@ -52,6 +52,8 @@ SESSION.headers.update({"User-Agent": "Mozilla/5.0 HCX-AI-LineBot/7.0"})
 UNIVERSE_CACHE = {"ts": 0, "data": []}
 DATA_CACHE = {}
 INTRADAY_CACHE = {}
+STOCK_NAME_CACHE = {"ts": 0, "map": {}}
+US_META_CACHE = {}
 SCAN_LOCK = threading.Lock()
 REMINDER_FILE = Path(os.environ.get("REMINDER_SCHEDULE_FILE", "/tmp/hcx_line_reminders_v7.json"))
 REMINDER_LOCK = threading.Lock()
@@ -294,6 +296,84 @@ def guess_field(row, keys):
         if any(str(t).lower() in ks for t in keys): return v
     return None
 
+def fetch_taiwan_stock_name_map(force=False):
+    """
+    上市 + 上櫃完整名稱快取。
+    目的：單股查詢時不再受 TOP 600 掃描名單限制，避免 6153 這類股票名稱顯示成代號。
+    """
+    now = time.time()
+    if not force and STOCK_NAME_CACHE.get("map") and now - STOCK_NAME_CACHE.get("ts", 0) < 21600:
+        return STOCK_NAME_CACHE["map"]
+
+    mp = {}
+    try:
+        r = SESSION.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            for row in data:
+                code = clean_text(guess_field(row, ["Code", "證券代號", "股票代號"]))
+                name = clean_text(guess_field(row, ["Name", "證券名稱", "股票名稱"]))
+                if is_common_stock(code, name):
+                    mp[code] = {"name": name, "market": "上市"}
+    except Exception as e:
+        print(f"上市名稱快取失敗：{e}", flush=True)
+
+    try:
+        r = SESSION.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            for row in data:
+                code = clean_text(guess_field(row, ["SecuritiesCompanyCode", "Code", "代號", "股票代號"]))
+                name = clean_text(guess_field(row, ["CompanyName", "Name", "名稱", "股票名稱"]))
+                if is_common_stock(code, name):
+                    mp[code] = {"name": name, "market": "上櫃"}
+    except Exception as e:
+        print(f"上櫃名稱快取失敗：{e}", flush=True)
+
+    extra = dict(FALLBACK_STOCKS)
+    extra.update({
+        "6153": "嘉聯益",
+    })
+    for code, name in extra.items():
+        if re.fullmatch(r"\d{4}", str(code)) and code not in mp:
+            mp[str(code)] = {"name": name, "market": "上市"}
+
+    STOCK_NAME_CACHE.update({"ts": now, "map": mp})
+    return mp
+
+def get_us_stock_meta(symbol):
+    symbol = str(symbol or "").upper().strip()
+    if symbol in US_META_CACHE:
+        return US_META_CACHE[symbol]
+    name = symbol
+    try:
+        info = yf.Ticker(symbol).get_info()
+        if isinstance(info, dict):
+            name = info.get("shortName") or info.get("longName") or symbol
+    except Exception:
+        try:
+            info = yf.Ticker(symbol).info
+            if isinstance(info, dict):
+                name = info.get("shortName") or info.get("longName") or symbol
+        except Exception:
+            pass
+    meta = {"symbol": symbol, "name": name}
+    US_META_CACHE[symbol] = meta
+    return meta
+
+def is_us_symbol_text(text):
+    text = str(text or "").strip()
+    m = re.fullmatch(r"(?:美股\s*)?([A-Za-z][A-Za-z0-9\.\-]{0,9})", text)
+    if not m:
+        return ""
+    sym = m.group(1).upper()
+    block = {"MENU", "VERSION", "VER", "WAKE", "WAKEUP"}
+    if sym in block:
+        return ""
+    return sym
+
 def fetch_twse_all():
     out = []
     try:
@@ -335,11 +415,12 @@ def fetch_market_universe(force=False):
     now = time.time()
     if not force and UNIVERSE_CACHE["data"] and now - UNIVERSE_CACHE["ts"] < 1800:
         return UNIVERSE_CACHE["data"]
+    name_map = fetch_taiwan_stock_name_map(force=force)
     rows = fetch_twse_all() + fetch_tpex_all()
     exists = {r["code"] for r in rows}
-    for code, name in FALLBACK_STOCKS.items():
+    for code, meta in name_map.items():
         if code not in exists:
-            rows.append({"code":code,"name":name,"market":"上市","close":0,"volume":0,"value":0})
+            rows.append({"code": code, "name": meta.get("name", code), "market": meta.get("market", "上市"), "close": 0, "volume": 0, "value": 0})
     for r in rows:
         if not r.get("value"):
             r["value"] = float(r.get("close") or 0) * float(r.get("volume") or 0)
@@ -351,12 +432,19 @@ def fetch_market_universe(force=False):
     return rows
 
 def get_stock_meta(code):
+    code = str(code).strip()
+    if re.fullmatch(r"\d{4}", code):
+        name_map = fetch_taiwan_stock_name_map()
+        if code in name_map:
+            return {"code": code, "name": name_map[code].get("name", code), "market": name_map[code].get("market", "上市")}
     for r in fetch_market_universe():
-        if r["code"] == str(code):
-            return {"code":str(code), "name":r["name"], "market":r.get("market","上市")}
-    return {"code":str(code), "name":FALLBACK_STOCKS.get(str(code), str(code)), "market":"上市"}
+        if r["code"] == code:
+            return {"code": code, "name": r["name"], "market": r.get("market", "上市")}
+    return {"code": code, "name": FALLBACK_STOCKS.get(code, code), "market": "上市"}
 
 def yahoo_symbols(code, market="上市"):
+    if market == "美股":
+        return [str(code).upper()]
     return [f"{code}.TWO", f"{code}.TW"] if market == "上櫃" else [f"{code}.TW", f"{code}.TWO"]
 
 def normalize_yf_df(df):
@@ -624,6 +712,74 @@ def analyze_one_stock(code):
 
 # 指令
 
+def analyze_us_stock(symbol):
+    symbol = str(symbol or "").upper().strip()
+    meta = get_us_stock_meta(symbol)
+    df, _ = download_daily(symbol, "美股", "6mo")
+    if df is None or df.empty or len(df) < 30:
+        return f"查不到美股 {symbol} 的資料，請確認代號。"
+
+    close_s = pd.to_numeric(df["Close"], errors="coerce")
+    high_s = pd.to_numeric(df["High"], errors="coerce")
+    low_s = pd.to_numeric(df["Low"], errors="coerce")
+
+    close = float(close_s.iloc[-1])
+    prev = float(close_s.iloc[-2])
+    change = close - prev
+    pct = change / prev * 100 if prev else 0
+
+    ma5 = float(close_s.rolling(5).mean().iloc[-1])
+    ma20 = float(close_s.rolling(20).mean().iloc[-1])
+    ma60 = float(close_s.rolling(60).mean().iloc[-1]) if len(close_s) >= 60 else ma20
+
+    bb_mid = float(close_s.rolling(20).mean().iloc[-1])
+    bb_std = float(close_s.rolling(20).std(ddof=0).iloc[-1])
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
+
+    high20 = float(high_s.tail(20).max())
+    low20 = float(low_s.tail(20).min())
+    atr = calc_atr14(df)
+
+    trend = "偏多" if close > ma5 > ma20 else "偏空" if close < ma5 < ma20 else "震盪"
+    advice = "短線偏多，留意回測支撐後是否再轉強。" if trend == "偏多" else "短線偏弱，若反彈無量仍需保守。" if trend == "偏空" else "目前偏震盪，等突破壓力或跌破支撐再決定方向。"
+
+    entry = round(close, 2)
+    stop = round(max(close - atr * 1.2, low20), 2) if trend != "偏空" else round(high20, 2)
+    take = round(max(close + atr * 1.5, high20), 2) if trend != "偏空" else round(max(close - atr * 1.5, low20), 2)
+
+    return f"""⚡ HCX-AI量子雷達
+🕒 時間：{query_time_text()}
+
+🇺🇸 美股：{symbol} {meta.get('name', symbol)}
+💰 現價：{close:.2f}
+📊 漲跌：{change:+.2f}
+📈 漲跌幅：{pct:+.2f}%
+
+⚡ MA5：{ma5:.2f}
+🌙 MA20：{ma20:.2f}
+🏔️ MA60：{ma60:.2f}
+🌊 ATR14：{atr:.2f}
+
+📊 日K布林通道
+🔺 上軌：{bb_upper:.2f}
+➖ 中軌：{bb_mid:.2f}
+🔻 下軌：{bb_lower:.2f}
+
+🧱 壓力：{high20:.2f}
+🧱 支撐：{low20:.2f}
+
+🧭 趨勢判斷：{trend}
+🧠 AI建議：{advice}
+
+🎯 建議進場價：{entry:.2f}
+✅ 建議停利價：{take:.2f}
+🛑 建議停損價：{stop:.2f}
+
+⚠️ 本訊息為程式估算，不保證獲利。"""
+
+# 指令
+
 def normalize_text(text):
     t = str(text or "").strip().replace("\n", "").replace(" ", "").replace("　", "").replace("/", "")
     for w in ["我要", "幫我", "查詢", "請查"]: t = t.replace(w, "")
@@ -842,7 +998,7 @@ def handle_message(event):
             reply_text(event.reply_token, f"✅ HCX-AI 開機中，請等候30秒!\n🕒 {query_time_text()}")
             return
         if msg.lower() in ["版本", "version", "ver"]:
-            reply_text(event.reply_token, f"✅ 目前版本：\n{APP_VERSION}\n\n🕒 {query_time_text()}"); return
+            reply_text(event.reply_token, f"✅ 目前版本：\n{APP_VERSION}"); return
         if msg in ["我的id", "我的ID", "userid", "userID"]:
             reply_text(event.reply_token, f"你的 LINE userId：\n{user_id}", menu=False); return
         if reminder_cmd:
@@ -852,6 +1008,9 @@ def handle_message(event):
         m = re.search(r"\d{4}", msg)
         if m:
             reply_text(event.reply_token, analyze_one_stock(m.group(0))); return
+        us_symbol = is_us_symbol_text(raw)
+        if us_symbol:
+            reply_text(event.reply_token, analyze_us_stock(us_symbol)); return
         reply_main_menu(event.reply_token)
     except Exception as e:
         print(f"handle_message 錯誤：{e}", flush=True); traceback.print_exc()
