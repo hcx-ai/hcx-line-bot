@@ -41,7 +41,7 @@ except Exception:
 
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-APP_VERSION = "V7.4 穩定版｜八宮格快捷鍵＋13點隔日沖"
+APP_VERSION = "V7.5.1 穩定版｜九宮格小鈴鐺＋波段股＋布林通道"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
@@ -160,7 +160,7 @@ def calc_tick_profit_info(entry, take_profit):
 def build_quick_reply():
     """
     LINE 底部 Quick Reply 原生是橫向滑動。
-    這裡只保留最常用 4 顆，完整 8 宮格請點「主選單」。
+    完整九宮格請點「主選單」。
     """
     if not HAS_QUICK_REPLY:
         return None
@@ -185,20 +185,20 @@ def _flex_button(label, text, style="secondary"):
 
 def build_main_menu_flex():
     """
-    V7.4 八宮格快捷鍵：
-    改成 2 欄 x 4 列，手機上文字比較不會被縮成「...」。
+    V7.5 九宮格快捷鍵：3欄 x 3列，共9個功能，每格都有標題。
     """
     if not HAS_FLEX_MENU:
         return None
 
-    def _row(left_label, left_text, right_label, right_text, left_style="secondary", right_style="secondary"):
+    def _row(a1, t1, a2, t2, a3, t3, s1="secondary", s2="secondary", s3="secondary"):
         return {
             "type": "box",
             "layout": "horizontal",
-            "spacing": "sm",
+            "spacing": "xs",
             "contents": [
-                _flex_button(left_label, left_text, left_style),
-                _flex_button(right_label, right_text, right_style),
+                _flex_button(a1, t1, s1),
+                _flex_button(a2, t2, s2),
+                _flex_button(a3, t3, s3),
             ],
         }
 
@@ -212,17 +212,16 @@ def build_main_menu_flex():
             "contents": [
                 {"type": "text", "text": "⚡ HCX-AI 量子雷達", "weight": "bold", "size": "lg"},
                 {"type": "text", "text": "請直接點選下方功能", "size": "sm", "color": "#666666"},
-                _row("版本號", "版本", "當沖多", "當沖多", "secondary", "primary"),
-                _row("當沖空", "當沖空", "隔日沖", "隔日沖", "primary", "primary"),
-                _row("台積電", "2330", "提醒多", "設定提醒 當沖多 08:50"),
-                _row("提醒空", "設定提醒 當沖空 09:00", "提醒隔", "設定提醒 隔日沖 13:00"),
-                {"type": "text", "text": "也可輸入：請開機、版本、股票代號", "size": "xs", "color": "#888888", "wrap": True},
+                _row("版本號", "版本", "當沖多", "當沖多", "當沖空", "當沖空", "secondary", "primary", "primary"),
+                _row("隔日沖", "隔日沖", "波段股", "波段股", "小鈴鐺", "我的提醒", "primary", "primary", "secondary"),
+                _row("提醒多", "設定提醒 當沖多 08:50", "提醒空", "設定提醒 當沖空 09:00", "提醒隔", "設定提醒 隔日沖 13:00"),
+                {"type": "text", "text": "也可輸入：請開機、股票代號、主選單", "size": "xs", "color": "#888888", "wrap": True},
             ],
         },
     }
     try:
         return FlexMessage(
-            alt_text="HCX-AI 八宮格快捷鍵",
+            alt_text="HCX-AI 九宮格快捷鍵",
             contents=FlexContainer.from_json(json.dumps(bubble, ensure_ascii=False)),
         )
     except Exception as e:
@@ -457,6 +456,7 @@ def score_stock(code, meta, command):
         swing_score = liq*0.25 + volscore*0.15 + trend_long*0.20 + swing_health*0.20 + pos*0.20
         if command == "當沖空": mode, base, signal = "intraday_short", short_score, "🟩 偏空當沖"
         elif command == "隔日沖": mode, base, signal = "swing", swing_score, "🟧 隔日沖觀察"
+        elif command == "波段股": mode, base, signal = "swing", swing_score, "🟦 波段觀察"
         elif command == "當沖股" and short_score > long_score: mode, base, signal = "intraday_short", short_score, "🟩 偏空當沖"
         else: mode, base, signal = "intraday_long", long_score, "🟥 偏多當沖"
         win_rate, samples = estimate_win_rate(df, mode)
@@ -499,7 +499,10 @@ def build_trade_plan(row):
 
 def run_quantum_scan(command):
     universe = fetch_market_universe()
-    deep_n = max(40, min(safe_int(os.environ.get("HCX_DEEP_SCAN", 120), 120), 240))
+    deep_n = safe_int(os.environ.get("HCX_DEEP_SCAN", 120), 120)
+    if command == "波段股":
+        deep_n = max(deep_n, safe_int(os.environ.get("HCX_SWING_DEEP_SCAN", 180), 180))
+    deep_n = max(40, min(deep_n, 260))
     candidates = universe[:deep_n]
     rows = []
     workers = max(3, min(safe_int(os.environ.get("HCX_WORKERS", 8), 8), 10))
@@ -533,6 +536,7 @@ def format_quantum_report(command, rows):
         "當沖多": "🔴 當沖多 TOP 5",
         "當沖空": "🟢 當沖空 TOP 5",
         "隔日沖": "🟠 隔日沖 TOP 5",
+        "波段股": "🟦 波段股 TOP 5",
     }
     if not rows:
         return f"""⚡ HCX-AI量子雷達
@@ -578,6 +582,11 @@ def analyze_one_stock(code):
     close_s = pd.to_numeric(df["Close"], errors="coerce"); high_s = pd.to_numeric(df["High"], errors="coerce"); low_s = pd.to_numeric(df["Low"], errors="coerce")
     close = float(close_s.iloc[-1]); prev = float(close_s.iloc[-2]); change = close-prev; pct = change/prev*100 if prev else 0
     ma5 = float(close_s.rolling(5).mean().iloc[-1]); ma20 = float(close_s.rolling(20).mean().iloc[-1]); ma60 = float(close_s.rolling(60).mean().iloc[-1]) if len(close_s)>=60 else ma20
+    bb_mid_raw = float(close_s.rolling(20).mean().iloc[-1])
+    bb_std = float(close_s.rolling(20).std(ddof=0).iloc[-1])
+    bb_upper = round_by_tick(bb_mid_raw + 2 * bb_std)
+    bb_mid = round_by_tick(bb_mid_raw)
+    bb_lower = round_by_tick(bb_mid_raw - 2 * bb_std)
     high20 = float(high_s.tail(20).max()); low20 = float(low_s.tail(20).min()); atr = calc_atr14(df)
     trend = "偏多" if close > ma5 > ma20 else "偏空" if close < ma5 < ma20 else "震盪"
     advice = "短線偏多，留意回測支撐後是否再轉強。" if trend == "偏多" else "短線偏弱，若反彈無量仍需保守。" if trend == "偏空" else "目前偏震盪，等突破壓力或跌破支撐再決定方向。"
@@ -594,6 +603,11 @@ def analyze_one_stock(code):
 🌙 MA20：{fmt_price(ma20)}
 🏔️ MA60：{fmt_price(ma60)}
 🌊 ATR14：{fmt_price(atr)}
+
+📊 日K布林通道
+🔺 上軌：{fmt_price(bb_upper)}
+➖ 中軌：{fmt_price(bb_mid)}
+🔻 下軌：{fmt_price(bb_lower)}
 
 🧱 壓力：{fmt_price(high20)}
 🧱 支撐：{fmt_price(low20)}
@@ -617,6 +631,7 @@ def normalize_text(text):
 
 def detect_quantum_command(text):
     t = normalize_text(text)
+    if any(w in t for w in ["波段股","波段","中線股","中線","波段選股"]): return "波段股"
     if any(w in t for w in ["當沖股","當衝股","最佳當沖","今日當沖"]): return "當沖股"
     if any(w in t for w in ["當沖多","當衝多","沖多","衝多","當沖做多"]): return "當沖多"
     if any(w in t for w in ["當沖空","當衝空","沖空","衝空","當沖做空"]): return "當沖空"
@@ -637,6 +652,10 @@ def help_message():
 🔴 當沖多
 🟢 當沖空
 🟠 隔日沖
+🟦 波段股
+
+觸控選單：
+🔳 主選單
 
 自動提醒：
 ⏰ 設定提醒 當沖多 08:50
