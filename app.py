@@ -34,7 +34,7 @@ except Exception:
     HAS_QUICK_REPLY = False
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-APP_VERSION = "V7.1 穩定版｜請開機指令＋定時推播＋觸控選單"
+APP_VERSION = "V7.2 穩定版｜推播格式優化＋ABC排名"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
@@ -137,15 +137,16 @@ def calc_atr14(df):
 
 def calc_tick_profit_info(entry, take_profit):
     try:
-        entry = float(entry); take_profit = float(take_profit); t = tick_size(entry)
+        entry = float(entry)
+        t = tick_size(entry)
         cost_rate = 0.001425 * 0.6 * 2 + 0.0015
         cost = entry * 1000 * cost_rate
         tick_profit = t * 1000
         breakeven = max(1, math.ceil(cost / max(tick_profit, 1)))
-        target_ticks = max(1, int(round(abs(take_profit - entry) / max(t, 0.01))))
-        return f"🔥 回本門檻：{breakeven} Tick｜建議停利約 {target_ticks} Tick"
+        return f"🔥 回本門檻：{breakeven} Tick"
     except Exception:
         return "🔥 回本門檻：依盤中成交價試算"
+
 
 # LINE 訊息
 
@@ -444,27 +445,47 @@ def run_quantum_scan(command):
     return format_quantum_report(command, final)
 
 def format_quantum_report(command, rows):
-    titles = {"當沖股":"⚡ 最佳當沖股 TOP 5","當沖多":"🔴 當沖多 TOP 5","當沖空":"🟢 當沖空 TOP 5","隔日沖":"🟠 隔日沖 TOP 5"}
+    titles = {
+        "當沖股": "⚡ 最佳當沖股 TOP 5",
+        "當沖多": "🔴 當沖多 TOP 5",
+        "當沖空": "🟢 當沖空 TOP 5",
+        "隔日沖": "🟠 隔日沖 TOP 5",
+    }
     if not rows:
         return f"""⚡ HCX-AI量子雷達
-🕒 查詢時間：{query_time_text()}
+🕒 時間：{query_time_text()}
 📌 指令：{command}
 
 本次暫無適合出手的股票。
 可稍後盤中再查，或等待量能與方向更明確。"""
-    lines = ["⚡ HCX-AI量子雷達", f"🕒 查詢時間：{query_time_text()}", titles.get(command, command), "━━━━━━━━━━━━━━"]
-    for i, r in enumerate(rows[:5], 1):
+
+    rank_labels = ["A", "B", "C", "D", "E"]
+    lines = [
+        "⚡ HCX-AI量子雷達",
+        f"🕒 時間：{query_time_text()}",
+        titles.get(command, command),
+        "━━━━━━━━━━━━━━",
+    ]
+
+    for i, r in enumerate(rows[:5]):
+        label = rank_labels[i] if i < len(rank_labels) else chr(65 + i)
         lines.append(
-            f"{i}. {r['code']} {r['name']}｜{r.get('signal','')}\n"
+            f"{label}. {r['code']} {r['name']}｜{r.get('signal','')}\n"
             f"   收盤 {fmt_price(r['close'])}｜漲跌 {fmt_pct(r['pct'])}｜量比 {float(r.get('vol_ratio') or 0):.2f}\n"
-            f"   🏆 AI勝率 {float(r.get('win_rate') or 0):.1f}%｜樣本 {int(r.get('samples') or 0)}｜職業評分 {float(r.get('rank_score') or 0):.1f}\n"
+            f"   🏆 AI勝率 {float(r.get('win_rate') or 0):.1f}%｜職業評分 {float(r.get('rank_score') or 0):.1f}\n"
             f"   🎯 建議進場價：{fmt_price(r.get('entry'))}\n"
             f"   ✅ 建議停利價：{fmt_price(r.get('take_profit'))}\n"
             f"   🛑 建議停損價：{fmt_price(r.get('stop'))}\n"
             f"   {r.get('tick_line','')}"
         )
-    lines += ["━━━━━━━━━━━━━━", "⚠️ 本訊息為HCX-AI量子雷達估算，不保證獲利。", "⚠️ 當沖請配合1分K轉折、盤中量能與紀律停損。"]
+
+    lines += [
+        "━━━━━━━━━━━━━━",
+        "⚠️ 本訊息為HCX-AI量子雷達估算，不保證獲利。",
+        "⚠️ 當沖請配合1分K轉折、盤中量能與紀律停損。",
+    ]
     return "\n".join(lines)[:4800]
+
 
 # 單檔分析
 
@@ -479,7 +500,7 @@ def analyze_one_stock(code):
     advice = "短線偏多，留意回測支撐後是否再轉強。" if trend == "偏多" else "短線偏弱，若反彈無量仍需保守。" if trend == "偏空" else "目前偏震盪，等突破壓力或跌破支撐再決定方向。"
     plan = build_trade_plan({"code":code,"name":meta['name'],"market":meta['market'],"close":close,"atr":atr,"high20":high20,"low20":low20,"trade_kind":"intraday_long"})
     return f"""⚡ HCX-AI量子雷達
-🕒 查詢時間：{query_time_text()}
+🕒 時間：{query_time_text()}
 
 🏷️ 股票：{code} {meta['name']}
 💰 現價：{fmt_price(close)}
@@ -675,7 +696,7 @@ def start_scan_async(user_id, command):
 系統正在啟動 HCX-AI 量子雷達篩選中...
 
 📊 掃描模式：選股日報核心 TOP 5
-🕒 查詢時間：{query_time_text()}
+🕒 時間：{query_time_text()}
 
 稍後會自動推播結果給你。"""
 
