@@ -43,7 +43,7 @@ except Exception:
 
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-APP_VERSION = "V7.6.2 穩定版"
+APP_VERSION = "V7.7 穩定版"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
@@ -157,50 +157,93 @@ def calc_atr14(df):
     except Exception:
         return 1.0
 
-def calc_triangle_convergence(df):
-    """
-    三角收斂概念評分：
-    1. 高點壓力線向下或趨平。
-    2. 低點支撐線向上或趨平。
-    3. 高低區間逐步收斂。
-    4. 布林通道寬度縮小。
-    5. 股價仍在收斂區內。
-    """
+def calc_week_trend(weekly_df):
     try:
-        d = df.copy().tail(60)
-        if d is None or len(d) < 35:
-            return 0.0
+        if weekly_df is None or weekly_df.empty or len(weekly_df) < 20:
+            return "資料不足", 50
+        close = pd.to_numeric(weekly_df["Close"], errors="coerce").dropna()
+        if len(close) < 20:
+            return "資料不足", 50
+        ma10 = close.rolling(10).mean()
+        ma30 = close.rolling(30).mean() if len(close) >= 30 else ma10
+        c = float(close.iloc[-1])
+        m10 = float(ma10.iloc[-1])
+        m30 = float(ma30.iloc[-1])
+        if c > m10 and m10 >= m30:
+            return "偏多", 100
+        if c < m10 and m10 <= m30:
+            return "偏空", 25
+        return "盤整", 65
+    except Exception:
+        return "資料不足", 50
+
+def calc_triangle_profile(df, weekly_df=None):
+    """
+    V7.7 三角收斂升級：
+    週K看大方向，日K判斷收斂型態。
+    分類：上升三角收斂 / 標準三角收斂 / 下降三角收斂 / 收斂整理。
+    """
+    default = {
+        "score": 0.0, "pattern": "收斂整理", "week_trend": "資料不足",
+        "breakout_price": None, "defense_price": None, "shrink_pct": 0.0
+    }
+    try:
+        d = df.copy().tail(70)
+        if d is None or len(d) < 40:
+            return default
+
         high = pd.to_numeric(d["High"], errors="coerce").dropna()
         low = pd.to_numeric(d["Low"], errors="coerce").dropna()
         close = pd.to_numeric(d["Close"], errors="coerce").dropna()
         vol = pd.to_numeric(d["Volume"], errors="coerce").dropna()
         n = min(len(high), len(low), len(close))
-        if n < 35:
-            return 0.0
-        high = high.tail(n); low = low.tail(n); close = close.tail(n)
+        if n < 40:
+            return default
+
+        high = high.tail(n)
+        low = low.tail(n)
+        close = close.tail(n)
         x = np.arange(n, dtype=float)
+        last_close = float(close.iloc[-1])
 
         hi_fit = np.polyfit(x, high.values, 1)
         lo_fit = np.polyfit(x, low.values, 1)
         hi_line = hi_fit[0] * x + hi_fit[1]
         lo_line = lo_fit[0] * x + lo_fit[1]
 
-        width_start = max(hi_line[0] - lo_line[0], 0.01)
-        width_end = max(hi_line[-1] - lo_line[-1], 0.01)
+        width_start = max(float(hi_line[0] - lo_line[0]), 0.01)
+        width_end = max(float(hi_line[-1] - lo_line[-1]), 0.01)
         shrink_pct = clip((width_start - width_end) / width_start * 100, 0, 100)
 
-        pressure_score = 100 if hi_fit[0] <= 0 else clip(100 - hi_fit[0] / max(float(close.iloc[-1]), 1) * 5000, 0, 100)
-        support_score = 100 if lo_fit[0] >= 0 else clip(100 + lo_fit[0] / max(float(close.iloc[-1]), 1) * 5000, 0, 100)
+        hi_norm = hi_fit[0] / max(last_close, 1) * 100
+        lo_norm = lo_fit[0] / max(last_close, 1) * 100
+        flat_th = 0.035
+
+        # 型態分類：優先抓勝率較佳的上升三角
+        if lo_norm > flat_th and abs(hi_norm) <= flat_th * 1.3:
+            pattern = "上升三角收斂"
+            type_score = 100
+        elif hi_norm < -flat_th and lo_norm > flat_th:
+            pattern = "標準三角收斂"
+            type_score = 82
+        elif hi_norm < -flat_th and abs(lo_norm) <= flat_th * 1.3:
+            pattern = "下降三角收斂"
+            type_score = 55
+        else:
+            pattern = "收斂整理"
+            type_score = 62
+
+        pressure_score = 100 if hi_fit[0] <= 0 else clip(100 - hi_fit[0] / max(last_close, 1) * 5000, 0, 100)
+        support_score = 100 if lo_fit[0] >= 0 else clip(100 + lo_fit[0] / max(last_close, 1) * 5000, 0, 100)
 
         ma20 = close.rolling(20).mean()
         sd20 = close.rolling(20).std(ddof=0)
         bb_width = ((ma20 + 2 * sd20) - (ma20 - 2 * sd20)) / ma20.replace(0, np.nan)
         bw_recent = float(bb_width.tail(5).mean())
-        bw_base = float(bb_width.tail(40).max())
-        bb_score = clip((1 - bw_recent / max(bw_base, 0.001)) * 130, 0, 100)
+        bw_base = float(bb_width.tail(45).max())
+        bb_score = clip((1 - bw_recent / max(bw_base, 0.001)) * 140, 0, 100)
 
-        last_close = float(close.iloc[-1])
-        inside = lo_line[-1] <= last_close <= hi_line[-1]
+        inside = float(lo_line[-1]) <= last_close <= float(hi_line[-1])
         inside_score = 100 if inside else 45
 
         vol_score = 55
@@ -209,18 +252,46 @@ def calc_triangle_convergence(df):
             base_vol = float(vol.tail(40).mean())
             vol_score = clip(100 - recent_vol / max(base_vol, 1) * 35, 35, 100)
 
+        week_trend, week_score = calc_week_trend(weekly_df)
+
         score = (
-            pressure_score * 0.18 +
-            support_score * 0.18 +
-            shrink_pct * 0.27 +
-            bb_score * 0.22 +
-            inside_score * 0.10 +
-            vol_score * 0.05
+            pressure_score * 0.12 +
+            support_score * 0.12 +
+            shrink_pct * 0.20 +
+            bb_score * 0.18 +
+            inside_score * 0.08 +
+            vol_score * 0.05 +
+            type_score * 0.15 +
+            week_score * 0.10
         )
-        return round(float(score), 1)
+
+        # 實戰偏好：上升三角 + 週K偏多，給額外加分；下降三角降低排序
+        if pattern == "上升三角收斂" and week_trend == "偏多":
+            score += 8
+        elif pattern == "標準三角收斂" and week_trend in ["偏多", "盤整"]:
+            score += 3
+        elif pattern == "下降三角收斂":
+            score -= 10
+        if week_trend == "偏空":
+            score -= 8
+
+        breakout = round_by_tick(max(float(hi_line[-1]), float(high.tail(10).max())), "up")
+        defense = round_by_tick(min(float(lo_line[-1]), float(low.tail(10).min())), "down")
+
+        return {
+            "score": round(float(clip(score, 0, 100)), 1),
+            "pattern": pattern,
+            "week_trend": week_trend,
+            "breakout_price": breakout,
+            "defense_price": defense,
+            "shrink_pct": round(float(shrink_pct), 1)
+        }
     except Exception as e:
         print(f"三角收斂評分失敗：{e}", flush=True)
-        return 0.0
+        return default
+
+def calc_triangle_convergence(df):
+    return calc_triangle_profile(df).get("score", 0.0)
 
 
 def calc_tick_profit_info(entry, take_profit):
@@ -662,6 +733,22 @@ def download_daily(code, market="上市", period="4mo"):
             print(f"日K失敗 {code} {sym}: {e}", flush=True)
     return None, ""
 
+def download_weekly(code, market="上市", period="2y"):
+    key = ("W", code, market, period)
+    now = time.time()
+    if key in DATA_CACHE and now - DATA_CACHE[key]["ts"] < 1800:
+        return DATA_CACHE[key]["df"], DATA_CACHE[key]["symbol"]
+    for sym in yahoo_symbols(code, market):
+        try:
+            df = yf.download(sym, period=period, interval="1wk", progress=False, auto_adjust=False, threads=False)
+            df = normalize_yf_df(df)
+            if df is not None and len(df) >= 20:
+                DATA_CACHE[key] = {"ts": now, "df": df, "symbol": sym}
+                return df, sym
+        except Exception as e:
+            print(f"週K失敗 {code} {sym}: {e}", flush=True)
+    return None, ""
+
 def download_intraday(code, market, interval="5m", period="5d"):
     key = ("I", code, market, interval, period); now = time.time()
     if key in INTRADAY_CACHE and now - INTRADAY_CACHE[key]["ts"] < 600:
@@ -733,8 +820,12 @@ def score_stock(code, meta, command):
         short_score = liq*0.25 + volscore*0.15 + vrscore*0.15 + trend_short*0.25 + pct_short*0.10 + (100-pos)*0.10
         swing_health = clip(100 - abs(pct - 2.0) * 12)
         swing_score = liq*0.25 + volscore*0.15 + trend_long*0.20 + swing_health*0.20 + pos*0.20
-        triangle_score = calc_triangle_convergence(df)
-        if command == "三角收斂": mode, base, signal = "swing", triangle_score, "🔺 三角收斂"
+        triangle_profile = {}
+        if command == "三角收斂":
+            weekly_df, _ = download_weekly(code, meta.get("market","上市"), "2y")
+            triangle_profile = calc_triangle_profile(df, weekly_df)
+            triangle_score = triangle_profile.get("score", 0.0)
+            mode, base, signal = "triangle", triangle_score, f"🔺 {triangle_profile.get('pattern','三角收斂')}"
         elif command == "當沖空": mode, base, signal = "intraday_short", short_score, "🟩 偏空當沖"
         elif command == "隔日沖": mode, base, signal = "swing", swing_score, "🟧 隔日沖觀察"
         elif command == "波段股": mode, base, signal = "swing", swing_score, "🟦 波段觀察"
@@ -744,10 +835,13 @@ def score_stock(code, meta, command):
         rank = base * 0.82 + win_rate * (0.18 * min(samples/12, 1))
         if value_m < safe_float(os.environ.get("HCX_MIN_VALUE_M", 30), 30): rank -= 18
         if volume_lots < safe_float(os.environ.get("HCX_MIN_LOTS", 1000), 1000): rank -= 15
-        return {"code":code,"name":meta.get("name",code),"market":meta.get("market","上市"),"close":close,"pct":pct,
+        row = {"code":code,"name":meta.get("name",code),"market":meta.get("market","上市"),"close":close,"pct":pct,
                 "volume_lots":volume_lots,"value_m":value_m,"vol_ratio":vol_ratio,"ma5":ma5,"ma20":ma20,"ma60":ma60,
                 "high20":high20,"low20":low20,"atr":atr,"score":round(base,1),"rank_score":round(rank,1),
                 "win_rate":round(win_rate,1),"samples":samples,"trade_kind":mode,"signal":signal}
+        if triangle_profile:
+            row.update(triangle_profile)
+        return row
     except Exception as e:
         print(f"score_stock 錯誤 {code}: {e}", flush=True); return None
 
@@ -767,7 +861,13 @@ def build_trade_plan(row):
             recent = df30.tail(10); support30 = float(recent["Low"].min()); resistance30 = float(recent["High"].max())
     except Exception: pass
     min_gap = max(atr*0.18, t*3)
-    if kind == "intraday_short":
+    if kind == "triangle":
+        entry = row.get("breakout_price") or resistance5
+        stop = row.get("defense_price") or support5
+        entry = round_by_tick(float(entry), "up")
+        stop = round_by_tick(float(stop), "down")
+        take = round_by_tick(entry + max(entry - stop, min_gap) * 1.20, "up")
+    elif kind == "intraday_short":
         entry = round_by_tick(min(close, support5), "down")
         stop = round_by_tick(max(resistance30, entry + min_gap), "up")
         take = round_by_tick(entry - max(stop-entry, min_gap)*0.60, "down")
@@ -840,15 +940,28 @@ def format_quantum_report(command, rows):
 
     for i, r in enumerate(rows[:5]):
         label = rank_labels[i] if i < len(rank_labels) else chr(65 + i)
-        lines.append(
-            f"{label}. {r['code']} {r['name']}｜{r.get('signal','')}\n"
-            f"   收盤 {fmt_price(r['close'])}｜漲跌 {fmt_pct(r['pct'])}｜量比 {float(r.get('vol_ratio') or 0):.2f}\n"
-            f"   🏆 AI勝率 {float(r.get('win_rate') or 0):.1f}%｜職業評分 {float(r.get('rank_score') or 0):.1f}\n"
-            f"   🎯 建議進場價：{fmt_price(r.get('entry'))}\n"
-            f"   ✅ 建議停利價：{fmt_price(r.get('take_profit'))}\n"
-            f"   🛑 建議停損價：{fmt_price(r.get('stop'))}\n"
-            f"   {r.get('tick_line','')}"
-        )
+        if command == "三角收斂":
+            lines.append(
+                f"{label}. {r['code']} {r['name']}｜{r.get('signal','')}\n"
+                f"   收盤 {fmt_price(r['close'])}｜漲跌 {fmt_pct(r['pct'])}｜量比 {float(r.get('vol_ratio') or 0):.2f}\n"
+                f"   🏆 AI勝率 {float(r.get('win_rate') or 0):.1f}%｜職業評分 {float(r.get('rank_score') or 0):.1f}\n"
+                f"   📐 型態：{r.get('pattern','收斂整理')}\n"
+                f"   📊 週K方向：{r.get('week_trend','資料不足')}｜收斂幅度 {float(r.get('shrink_pct') or 0):.1f}%\n"
+                f"   🎯 突破觀察價：{fmt_price(r.get('breakout_price') or r.get('entry'))}\n"
+                f"   ✅ 建議停利價：{fmt_price(r.get('take_profit'))}\n"
+                f"   🛑 防守價：{fmt_price(r.get('defense_price') or r.get('stop'))}\n"
+                f"   {r.get('tick_line','')}"
+            )
+        else:
+            lines.append(
+                f"{label}. {r['code']} {r['name']}｜{r.get('signal','')}\n"
+                f"   收盤 {fmt_price(r['close'])}｜漲跌 {fmt_pct(r['pct'])}｜量比 {float(r.get('vol_ratio') or 0):.2f}\n"
+                f"   🏆 AI勝率 {float(r.get('win_rate') or 0):.1f}%｜職業評分 {float(r.get('rank_score') or 0):.1f}\n"
+                f"   🎯 建議進場價：{fmt_price(r.get('entry'))}\n"
+                f"   ✅ 建議停利價：{fmt_price(r.get('take_profit'))}\n"
+                f"   🛑 建議停損價：{fmt_price(r.get('stop'))}\n"
+                f"   {r.get('tick_line','')}"
+            )
 
     lines += [
         "━━━━━━━━━━━━━━",
