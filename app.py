@@ -43,7 +43,7 @@ except Exception:
 
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-APP_VERSION = "V7.6.1 穩定版"
+APP_VERSION = "V7.6.2 穩定版"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
@@ -112,9 +112,11 @@ def parse_id_list(name):
 
 def is_member_only(): return parse_bool_env("MEMBER_ONLY_MODE", False)
 def is_admin_user(user_id): return user_id in parse_id_list("ADMIN_USER_IDS")
+def is_advanced_user(user_id):
+    return is_admin_user(user_id) or str(user_id) in parse_id_list("ADVANCED_USER_IDS")
 def is_authorized_user(user_id):
     if not is_member_only(): return True
-    return user_id in parse_id_list("AUTHORIZED_USER_IDS") or is_admin_user(user_id)
+    return user_id in parse_id_list("AUTHORIZED_USER_IDS") or is_advanced_user(user_id)
 
 def fmt_price(x):
     try:
@@ -1013,7 +1015,7 @@ def save_triangle_users(users):
         print(f"儲存三角收斂權限失敗：{e}", flush=True)
 
 def is_triangle_authorized(user_id):
-    return str(user_id) in load_triangle_users() or is_admin_user(str(user_id))
+    return str(user_id) in load_triangle_users() or is_advanced_user(str(user_id))
 
 def handle_triangle_password(user_id, raw_text):
     txt = str(raw_text or "").strip()
@@ -1060,6 +1062,7 @@ def help_message():
 主選單
 請開機
 版本
+會員等級
 我的ID"""
 
 # 提醒
@@ -1239,6 +1242,9 @@ def handle_message(event):
             return
         if msg.lower() in ["版本", "version", "ver"]:
             reply_text(event.reply_token, f"✅ 目前版本：\n{APP_VERSION}"); return
+        if msg in ["會員等級", "我的等級", "等級"]:
+            level = "💎 進階會員" if is_advanced_user(user_id) else "✅ 一般會員"
+            reply_text(event.reply_token, f"你的會員等級：\n{level}", menu=False); return
         if msg in ["我的id", "我的ID", "userid", "userID"]:
             reply_text(event.reply_token, f"你的 LINE userId：\n{user_id}", menu=False); return
         if reminder_cmd:
