@@ -32,9 +32,16 @@ try:
     HAS_QUICK_REPLY = True
 except Exception:
     HAS_QUICK_REPLY = False
+
+try:
+    from linebot.v3.messaging import FlexMessage, FlexContainer
+    HAS_FLEX_MENU = True
+except Exception:
+    HAS_FLEX_MENU = False
+
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-APP_VERSION = "V7.2 穩定版｜推播格式優化＋ABC排名"
+APP_VERSION = "V7.3 穩定版｜13點隔日沖＋兩排觸控選單"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
@@ -151,13 +158,92 @@ def calc_tick_profit_info(entry, take_profit):
 # LINE 訊息
 
 def build_quick_reply():
-    if not HAS_QUICK_REPLY: return None
+    """
+    LINE Quick Reply 原生是橫向滑動，不能強制做成上下兩排。
+    所以這裡只保留 4 顆常用提醒按鈕，避免會員還要往右滑。
+    真正上下兩排按鈕由「主選單」Flex Menu 提供。
+    """
+    if not HAS_QUICK_REPLY:
+        return None
     labels = [
-        ("當沖股", "當沖股"), ("當沖多", "當沖多"), ("當沖空", "當沖空"), ("隔日沖", "隔日沖"),
-        ("我的提醒", "我的提醒"), ("08:50當沖多", "設定提醒 當沖多 08:50"),
-        ("09:00當沖空", "設定提醒 當沖空 09:00"), ("13:35隔日沖", "設定提醒 隔日沖 13:35"),
+        ("我的提醒", "我的提醒"),
+        ("08:50當沖多", "設定提醒 當沖多 08:50"),
+        ("09:00當沖空", "設定提醒 當沖空 09:00"),
+        ("13:00隔日沖", "設定提醒 隔日沖 13:00"),
     ]
     return QuickReply(items=[QuickReplyItem(action=MessageAction(label=a, text=b)) for a, b in labels])
+
+
+def _flex_button(label, text, style="secondary"):
+    return {
+        "type": "button",
+        "style": style,
+        "height": "sm",
+        "action": {"type": "message", "label": label, "text": text},
+    }
+
+
+def build_main_menu_flex():
+    """兩排觸控式選單，避免 Quick Reply 需要左右滑動。"""
+    if not HAS_FLEX_MENU:
+        return None
+
+    bubble = {
+        "type": "bubble",
+        "size": "mega",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "text": "⚡ HCX-AI 量子雷達", "weight": "bold", "size": "lg"},
+                {"type": "text", "text": "請直接點選下方功能", "size": "sm", "color": "#666666"},
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "spacing": "sm",
+                    "contents": [
+                        _flex_button("當沖股", "當沖股", "primary"),
+                        _flex_button("當沖多", "當沖多", "primary"),
+                        _flex_button("當沖空", "當沖空", "primary"),
+                        _flex_button("隔日沖", "隔日沖", "primary"),
+                    ],
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "spacing": "sm",
+                    "contents": [
+                        _flex_button("我的提醒", "我的提醒"),
+                        _flex_button("08:50沖多", "設定提醒 當沖多 08:50"),
+                        _flex_button("09:00沖空", "設定提醒 當沖空 09:00"),
+                        _flex_button("13:00隔沖", "設定提醒 隔日沖 13:00"),
+                    ],
+                },
+                {"type": "text", "text": "也可輸入：請開機、版本、股票代號", "size": "xs", "color": "#888888", "wrap": True},
+            ],
+        },
+    }
+    try:
+        return FlexMessage(
+            alt_text="HCX-AI 主選單",
+            contents=FlexContainer.from_json(json.dumps(bubble, ensure_ascii=False)),
+        )
+    except Exception as e:
+        print(f"Flex選單建立失敗：{e}", flush=True)
+        return None
+
+
+def reply_main_menu(reply_token):
+    flex = build_main_menu_flex()
+    if flex is None:
+        reply_text(reply_token, help_message())
+        return
+
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.reply_message(ReplyMessageRequest(reply_token=reply_token, messages=[flex]))
+
 
 def make_text_message(text, menu=True):
     text = str(text)[:4900]
@@ -558,11 +644,12 @@ def help_message():
 自動提醒：
 ⏰ 設定提醒 當沖多 08:50
 ⏰ 設定提醒 當沖空 09:00
-⏰ 設定提醒 隔日沖 13:35
+⏰ 設定提醒 隔日沖 13:00
 📋 我的提醒
 🗑️ 取消提醒 當沖多
 
 其他：
+主選單
 請開機
 版本
 我的ID"""
@@ -602,7 +689,7 @@ def reminder_help():
 設定提醒 當沖股 08:50
 設定提醒 當沖多 08:50
 設定提醒 當沖空 09:00
-設定提醒 隔日沖 13:35
+設定提醒 隔日沖 13:00
 
 查詢：我的提醒
 取消：取消提醒 當沖多
@@ -732,6 +819,9 @@ def handle_message(event):
         if not is_authorized_user(user_id):
             reply_text(event.reply_token, member_block_message(user_id), menu=False); return
         reminder_cmd = parse_reminder_command(raw); quantum_cmd = detect_quantum_command(raw)
+        if msg in ["主選單", "選單", "功能選單", "menu", "MENU"]:
+            reply_main_menu(event.reply_token)
+            return
         if msg in ["請開機", "開機", "開機中", "喚醒", "wake", "wakeup"] or msg.lower() in ["wake", "wake up"]:
             reply_text(event.reply_token, f"✅ HCX-AI 開機中，請等候30秒!\n🕒 {query_time_text()}")
             return
@@ -746,7 +836,7 @@ def handle_message(event):
         m = re.search(r"\d{4}", msg)
         if m:
             reply_text(event.reply_token, analyze_one_stock(m.group(0))); return
-        reply_text(event.reply_token, help_message())
+        reply_main_menu(event.reply_token)
     except Exception as e:
         print(f"handle_message 錯誤：{e}", flush=True); traceback.print_exc()
         try: reply_text(event.reply_token, "⚠️ 系統暫時忙碌，請稍後再試。")
