@@ -12,20 +12,22 @@ import time
 import math
 import traceback
 import threading
+import uuid
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+import numpy as np
 import requests
 import yfinance as yf
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
-    ReplyMessageRequest, PushMessageRequest, TextMessage,
+    ReplyMessageRequest, PushMessageRequest, TextMessage, ImageMessage,
 )
 try:
     from linebot.v3.messaging import QuickReply, QuickReplyItem, MessageAction
@@ -41,7 +43,7 @@ except Exception:
 
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-APP_VERSION = "V7.5.2 穩定版"
+APP_VERSION = "V7.6 穩定版"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
@@ -54,6 +56,15 @@ DATA_CACHE = {}
 INTRADAY_CACHE = {}
 STOCK_NAME_CACHE = {"ts": 0, "map": {}}
 US_META_CACHE = {}
+TRIANGLE_AUTH_CACHE = {"ts": 0, "users": set()}
+TRIANGLE_AUTH_FILE = Path(os.environ.get("HCX_TRIANGLE_AUTH_FILE", "/tmp/hcx_triangle_auth.json"))
+TRIANGLE_PASSWORD = os.environ.get("HCX_TRIANGLE_PASSWORD", "HCX694509")
+PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://hcx-line-bot.onrender.com").rstrip("/")
+CHART_DIR = Path(os.environ.get("HCX_CHART_DIR", "/tmp/hcx_charts"))
+try:
+    CHART_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 SCAN_LOCK = threading.Lock()
 REMINDER_FILE = Path(os.environ.get("REMINDER_SCHEDULE_FILE", "/tmp/hcx_line_reminders_v7.json"))
 REMINDER_LOCK = threading.Lock()
@@ -144,6 +155,72 @@ def calc_atr14(df):
     except Exception:
         return 1.0
 
+def calc_triangle_convergence(df):
+    """
+    三角收斂概念評分：
+    1. 高點壓力線向下或趨平。
+    2. 低點支撐線向上或趨平。
+    3. 高低區間逐步收斂。
+    4. 布林通道寬度縮小。
+    5. 股價仍在收斂區內。
+    """
+    try:
+        d = df.copy().tail(60)
+        if d is None or len(d) < 35:
+            return 0.0
+        high = pd.to_numeric(d["High"], errors="coerce").dropna()
+        low = pd.to_numeric(d["Low"], errors="coerce").dropna()
+        close = pd.to_numeric(d["Close"], errors="coerce").dropna()
+        vol = pd.to_numeric(d["Volume"], errors="coerce").dropna()
+        n = min(len(high), len(low), len(close))
+        if n < 35:
+            return 0.0
+        high = high.tail(n); low = low.tail(n); close = close.tail(n)
+        x = np.arange(n, dtype=float)
+
+        hi_fit = np.polyfit(x, high.values, 1)
+        lo_fit = np.polyfit(x, low.values, 1)
+        hi_line = hi_fit[0] * x + hi_fit[1]
+        lo_line = lo_fit[0] * x + lo_fit[1]
+
+        width_start = max(hi_line[0] - lo_line[0], 0.01)
+        width_end = max(hi_line[-1] - lo_line[-1], 0.01)
+        shrink_pct = clip((width_start - width_end) / width_start * 100, 0, 100)
+
+        pressure_score = 100 if hi_fit[0] <= 0 else clip(100 - hi_fit[0] / max(float(close.iloc[-1]), 1) * 5000, 0, 100)
+        support_score = 100 if lo_fit[0] >= 0 else clip(100 + lo_fit[0] / max(float(close.iloc[-1]), 1) * 5000, 0, 100)
+
+        ma20 = close.rolling(20).mean()
+        sd20 = close.rolling(20).std(ddof=0)
+        bb_width = ((ma20 + 2 * sd20) - (ma20 - 2 * sd20)) / ma20.replace(0, np.nan)
+        bw_recent = float(bb_width.tail(5).mean())
+        bw_base = float(bb_width.tail(40).max())
+        bb_score = clip((1 - bw_recent / max(bw_base, 0.001)) * 130, 0, 100)
+
+        last_close = float(close.iloc[-1])
+        inside = lo_line[-1] <= last_close <= hi_line[-1]
+        inside_score = 100 if inside else 45
+
+        vol_score = 55
+        if len(vol) >= 40:
+            recent_vol = float(vol.tail(10).mean())
+            base_vol = float(vol.tail(40).mean())
+            vol_score = clip(100 - recent_vol / max(base_vol, 1) * 35, 35, 100)
+
+        score = (
+            pressure_score * 0.18 +
+            support_score * 0.18 +
+            shrink_pct * 0.27 +
+            bb_score * 0.22 +
+            inside_score * 0.10 +
+            vol_score * 0.05
+        )
+        return round(float(score), 1)
+    except Exception as e:
+        print(f"三角收斂評分失敗：{e}", flush=True)
+        return 0.0
+
+
 def calc_tick_profit_info(entry, take_profit):
     try:
         entry = float(entry)
@@ -169,7 +246,7 @@ def build_quick_reply():
     labels = [
         ("主選單", "主選單"),
         ("08:50沖多", "設定提醒 當沖多 08:50"),
-        ("09:00沖空", "設定提醒 當沖空 09:00"),
+        ("10:00沖空", "設定提醒 當沖空 10:00"),
         ("13:00隔沖", "設定提醒 隔日沖 13:00"),
     ]
     return QuickReply(items=[QuickReplyItem(action=MessageAction(label=a, text=b)) for a, b in labels])
@@ -216,7 +293,7 @@ def build_main_menu_flex():
                 {"type": "text", "text": "請直接點選下方功能", "size": "sm", "color": "#666666"},
                 _row("版本號", "版本", "當沖多", "當沖多", "當沖空", "當沖空", "secondary", "primary", "primary"),
                 _row("隔日沖", "隔日沖", "波段股", "波段股", "小鈴鐺", "我的提醒", "primary", "primary", "secondary"),
-                _row("提醒多", "設定提醒 當沖多 08:50", "提醒空", "設定提醒 當沖空 09:00", "提醒隔", "設定提醒 隔日沖 13:00"),
+                _row("提醒多", "設定提醒 當沖多 08:50", "提醒空", "設定提醒 當沖空 10:00", "提醒隔", "設定提醒 隔日沖 13:00"),
                 {"type": "text", "text": "也可輸入：請開機、股票代號、主選單", "size": "xs", "color": "#888888", "wrap": True},
             ],
         },
@@ -279,6 +356,118 @@ def member_block_message(user_id):
 {user_id}
 
 請將這組 ID 提供給管理員開通。"""
+
+def public_chart_url(filename):
+    return f"{PUBLIC_BASE_URL}/chart/{filename}"
+
+def make_stock_chart(code, name, df):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+
+        d = df.copy().tail(60)
+        if d is None or d.empty or len(d) < 25:
+            return ""
+
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=["Open", "High", "Low", "Close"])
+        if d.empty:
+            return ""
+
+        close = d["Close"]
+        ma20 = close.rolling(20).mean()
+        sd20 = close.rolling(20).std(ddof=0)
+        upper = ma20 + 2 * sd20
+        lower = ma20 - 2 * sd20
+
+        x = np.arange(len(d))
+        fig = plt.figure(figsize=(9.5, 6.2), dpi=160)
+        ax = fig.add_axes([0.08, 0.28, 0.86, 0.62])
+        axv = fig.add_axes([0.08, 0.09, 0.86, 0.15], sharex=ax)
+
+        # Bollinger river
+        ax.plot(x, upper.values, linewidth=1, alpha=0.8)
+        ax.plot(x, ma20.values, linewidth=1, alpha=0.7)
+        ax.plot(x, lower.values, linewidth=1, alpha=0.8)
+        ax.fill_between(x, lower.values.astype(float), upper.values.astype(float), alpha=0.12)
+
+        # Candles
+        width = 0.55
+        for i, (_, row) in enumerate(d.iterrows()):
+            o, h, l, c = float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
+            color = "#e53935" if c >= o else "#00a65a"  # 台股：紅漲綠跌
+            ax.vlines(i, l, h, color=color, linewidth=1)
+            bottom = min(o, c)
+            height = max(abs(c - o), max(c, o) * 0.001)
+            ax.add_patch(Rectangle((i - width/2, bottom), width, height, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.9))
+            axv.bar(i, float(row.get("Volume", 0))/1000, color=color, width=0.65, alpha=0.85)
+
+        # Triangle convergence lines
+        recent_n = min(45, len(d))
+        xx = np.arange(recent_n, dtype=float)
+        high = d["High"].tail(recent_n).values.astype(float)
+        low = d["Low"].tail(recent_n).values.astype(float)
+        hi_fit = np.polyfit(xx, high, 1)
+        lo_fit = np.polyfit(xx, low, 1)
+        start = len(d) - recent_n
+        tri_x = np.arange(start, len(d))
+        rel_x = np.arange(recent_n)
+        ax.plot(tri_x, hi_fit[0]*rel_x + hi_fit[1], linewidth=1.3)
+        ax.plot(tri_x, lo_fit[0]*rel_x + lo_fit[1], linewidth=1.3)
+
+        last_close = float(d["Close"].iloc[-1])
+        ax.axhline(last_close, linestyle="--", linewidth=0.8, alpha=0.7)
+        ax.text(len(d)-1, last_close, f" {fmt_price(last_close)}", va="center", fontsize=8)
+
+        title = f"{code} {name}｜日K布林＋三角收斂"
+        ax.set_title(title, fontsize=11)
+        ax.grid(True, alpha=0.25)
+        axv.grid(True, alpha=0.2)
+        axv.set_ylabel("量", fontsize=8)
+
+        labels = []
+        positions = []
+        idx_list = list(d.index)
+        for i in range(0, len(idx_list), max(1, len(idx_list)//6)):
+            positions.append(i)
+            try:
+                labels.append(pd.to_datetime(idx_list[i]).strftime("%m/%d"))
+            except Exception:
+                labels.append(str(i))
+        axv.set_xticks(positions)
+        axv.set_xticklabels(labels, fontsize=8)
+        plt.setp(ax.get_xticklabels(), visible=False)
+
+        filename = f"{code}_{uuid.uuid4().hex[:10]}.png"
+        path = CHART_DIR / filename
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+        return public_chart_url(filename)
+    except Exception as e:
+        print(f"圖表產生失敗 {code}: {e}", flush=True)
+        return ""
+
+def reply_text_with_image(reply_token, text, image_url="", menu=True):
+    messages = [make_text_message(text, menu)]
+    if image_url:
+        try:
+            messages.append(ImageMessage(original_content_url=image_url, preview_image_url=image_url))
+        except Exception as e:
+            print(f"圖片訊息建立失敗：{e}", flush=True)
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.reply_message(ReplyMessageRequest(reply_token=reply_token, messages=messages[:5]))
+
+@app.route("/chart/<filename>")
+def chart_file(filename):
+    safe = re.sub(r"[^A-Za-z0-9_\-.]", "", str(filename))
+    path = CHART_DIR / safe
+    if not path.exists():
+        return "Not found", 404
+    return send_file(str(path), mimetype="image/png")
 
 # 市場資料
 
@@ -542,7 +731,9 @@ def score_stock(code, meta, command):
         short_score = liq*0.25 + volscore*0.15 + vrscore*0.15 + trend_short*0.25 + pct_short*0.10 + (100-pos)*0.10
         swing_health = clip(100 - abs(pct - 2.0) * 12)
         swing_score = liq*0.25 + volscore*0.15 + trend_long*0.20 + swing_health*0.20 + pos*0.20
-        if command == "當沖空": mode, base, signal = "intraday_short", short_score, "🟩 偏空當沖"
+        triangle_score = calc_triangle_convergence(df)
+        if command == "三角收斂": mode, base, signal = "swing", triangle_score, "🔺 三角收斂"
+        elif command == "當沖空": mode, base, signal = "intraday_short", short_score, "🟩 偏空當沖"
         elif command == "隔日沖": mode, base, signal = "swing", swing_score, "🟧 隔日沖觀察"
         elif command == "波段股": mode, base, signal = "swing", swing_score, "🟦 波段觀察"
         elif command == "當沖股" and short_score > long_score: mode, base, signal = "intraday_short", short_score, "🟩 偏空當沖"
@@ -590,6 +781,8 @@ def run_quantum_scan(command):
     deep_n = safe_int(os.environ.get("HCX_DEEP_SCAN", 120), 120)
     if command == "波段股":
         deep_n = max(deep_n, safe_int(os.environ.get("HCX_SWING_DEEP_SCAN", 180), 180))
+    if command == "三角收斂":
+        deep_n = max(deep_n, safe_int(os.environ.get("HCX_TRIANGLE_DEEP_SCAN", 220), 220))
     deep_n = max(40, min(deep_n, 260))
     candidates = universe[:deep_n]
     rows = []
@@ -625,6 +818,7 @@ def format_quantum_report(command, rows):
         "當沖空": "🟢 當沖空 TOP 5",
         "隔日沖": "🟠 隔日沖 TOP 5",
         "波段股": "🟦 波段股 TOP 5",
+        "三角收斂": "🔺 三角收斂 TOP 5",
     }
     if not rows:
         return f"""⚡ HCX-AI量子雷達
@@ -787,12 +981,53 @@ def normalize_text(text):
 
 def detect_quantum_command(text):
     t = normalize_text(text)
+    if any(w in t for w in ["三角收斂","三角整理","收斂股","三角選股","三角型態"]): return "三角收斂"
     if any(w in t for w in ["波段股","波段","中線股","中線","波段選股"]): return "波段股"
     if any(w in t for w in ["當沖股","當衝股","最佳當沖","今日當沖"]): return "當沖股"
     if any(w in t for w in ["當沖多","當衝多","沖多","衝多","當沖做多"]): return "當沖多"
     if any(w in t for w in ["當沖空","當衝空","沖空","衝空","當沖做空"]): return "當沖空"
     if any(w in t for w in ["隔日沖","隔日衝","隔日"]): return "隔日沖"
     return None
+
+def load_triangle_users():
+    now = time.time()
+    if TRIANGLE_AUTH_CACHE.get("users") and now - TRIANGLE_AUTH_CACHE.get("ts", 0) < 300:
+        return TRIANGLE_AUTH_CACHE["users"]
+    users = set()
+    try:
+        if TRIANGLE_AUTH_FILE.exists():
+            data = json.loads(TRIANGLE_AUTH_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                users = set(str(x) for x in data)
+    except Exception as e:
+        print(f"讀取三角收斂權限失敗：{e}", flush=True)
+    TRIANGLE_AUTH_CACHE.update({"ts": now, "users": users})
+    return users
+
+def save_triangle_users(users):
+    try:
+        TRIANGLE_AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TRIANGLE_AUTH_FILE.write_text(json.dumps(sorted(list(users)), ensure_ascii=False, indent=2), encoding="utf-8")
+        TRIANGLE_AUTH_CACHE.update({"ts": time.time(), "users": set(users)})
+    except Exception as e:
+        print(f"儲存三角收斂權限失敗：{e}", flush=True)
+
+def is_triangle_authorized(user_id):
+    return str(user_id) in load_triangle_users() or is_admin_user(str(user_id))
+
+def handle_triangle_password(user_id, raw_text):
+    txt = str(raw_text or "").strip()
+    compact = normalize_text(txt)
+    if TRIANGLE_PASSWORD and (TRIANGLE_PASSWORD in txt or compact == normalize_text(TRIANGLE_PASSWORD)):
+        users = load_triangle_users()
+        users.add(str(user_id))
+        save_triangle_users(users)
+        return "✅ 三角收斂功能已開通\n請輸入：三角收斂"
+    return ""
+
+def triangle_password_message():
+    return "🔒 三角收斂為付費功能\n請輸入專屬密碼後再使用。"
+
 
 def help_message():
     return f"""🌈 HCX-AI 量子雷達
@@ -809,13 +1044,14 @@ def help_message():
 🟢 當沖空
 🟠 隔日沖
 🟦 波段股
+🔺 三角收斂（付費）
 
 觸控選單：
 🔳 主選單
 
 自動提醒：
 ⏰ 設定提醒 當沖多 08:50
-⏰ 設定提醒 當沖空 09:00
+⏰ 設定提醒 當沖空 10:00
 ⏰ 設定提醒 隔日沖 13:00
 📋 我的提醒
 🗑️ 取消提醒 當沖多
@@ -860,7 +1096,7 @@ def reminder_help():
 範例：
 設定提醒 當沖股 08:50
 設定提醒 當沖多 08:50
-設定提醒 當沖空 09:00
+設定提醒 當沖空 10:00
 設定提醒 隔日沖 13:00
 
 查詢：我的提醒
@@ -990,6 +1226,10 @@ def handle_message(event):
     try:
         if not is_authorized_user(user_id):
             reply_text(event.reply_token, member_block_message(user_id), menu=False); return
+        pw_msg = handle_triangle_password(user_id, raw)
+        if pw_msg:
+            reply_text(event.reply_token, pw_msg)
+            return
         reminder_cmd = parse_reminder_command(raw); quantum_cmd = detect_quantum_command(raw)
         if msg in ["主選單", "選單", "功能選單", "menu", "MENU"]:
             reply_main_menu(event.reply_token)
@@ -1004,13 +1244,34 @@ def handle_message(event):
         if reminder_cmd:
             reply_text(event.reply_token, handle_reminder(user_id, reminder_cmd)); return
         if quantum_cmd:
+            if quantum_cmd == "三角收斂" and not is_triangle_authorized(user_id):
+                reply_text(event.reply_token, triangle_password_message())
+                return
             reply_text(event.reply_token, start_scan_async(user_id, quantum_cmd)); return
         m = re.search(r"\d{4}", msg)
         if m:
-            reply_text(event.reply_token, analyze_one_stock(m.group(0))); return
+            code = m.group(0)
+            text = analyze_one_stock(code)
+            image_url = ""
+            try:
+                meta = get_stock_meta(code)
+                df, _ = download_daily(code, meta.get("market", "上市"), "6mo")
+                if df is not None and not df.empty:
+                    image_url = make_stock_chart(code, meta.get("name", code), df)
+            except Exception as e:
+                print(f"單股圖片處理失敗 {code}: {e}", flush=True)
+            reply_text_with_image(event.reply_token, text, image_url); return
         us_symbol = is_us_symbol_text(raw)
         if us_symbol:
-            reply_text(event.reply_token, analyze_us_stock(us_symbol)); return
+            text = analyze_us_stock(us_symbol)
+            image_url = ""
+            try:
+                df, _ = download_daily(us_symbol, "美股", "6mo")
+                if df is not None and not df.empty:
+                    image_url = make_stock_chart(us_symbol, get_us_stock_meta(us_symbol).get("name", us_symbol), df)
+            except Exception as e:
+                print(f"美股圖片處理失敗 {us_symbol}: {e}", flush=True)
+            reply_text_with_image(event.reply_token, text, image_url); return
         reply_main_menu(event.reply_token)
     except Exception as e:
         print(f"handle_message 錯誤：{e}", flush=True); traceback.print_exc()
