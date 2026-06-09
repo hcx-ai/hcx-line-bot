@@ -43,7 +43,7 @@ except Exception:
 
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-APP_VERSION = "V7.6 穩定版"
+APP_VERSION = "V7.6.1 穩定版"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
@@ -291,7 +291,7 @@ def build_main_menu_flex():
             "contents": [
                 {"type": "text", "text": "⚡ HCX-AI 量子雷達", "weight": "bold", "size": "lg"},
                 {"type": "text", "text": "請直接點選下方功能", "size": "sm", "color": "#666666"},
-                _row("版本號", "版本", "當沖多", "當沖多", "當沖空", "當沖空", "secondary", "primary", "primary"),
+                _row("三角收", "三角收斂", "當沖多", "當沖多", "當沖空", "當沖空", "primary", "primary", "primary"),
                 _row("隔日沖", "隔日沖", "波段股", "波段股", "小鈴鐺", "我的提醒", "primary", "primary", "secondary"),
                 _row("提醒多", "設定提醒 當沖多 08:50", "提醒空", "設定提醒 當沖空 10:00", "提醒隔", "設定提醒 隔日沖 13:00"),
                 {"type": "text", "text": "也可輸入：請開機、股票代號、主選單", "size": "xs", "color": "#888888", "wrap": True},
