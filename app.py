@@ -43,7 +43,7 @@ except Exception:
 
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-APP_VERSION = "V7.7 穩定版"
+APP_VERSION = "V7.8 穩定版"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
@@ -522,6 +522,159 @@ def make_stock_chart(code, name, df):
     except Exception as e:
         print(f"圖表產生失敗 {code}: {e}", flush=True)
         return ""
+
+
+def build_stock_snapshot_for_card(code, name, df, market="上市"):
+    try:
+        close_s = pd.to_numeric(df["Close"], errors="coerce")
+        high_s = pd.to_numeric(df["High"], errors="coerce")
+        low_s = pd.to_numeric(df["Low"], errors="coerce")
+
+        close = float(close_s.iloc[-1])
+        prev = float(close_s.iloc[-2])
+        change = close - prev
+        pct = change / prev * 100 if prev else 0
+
+        ma5 = float(close_s.rolling(5).mean().iloc[-1])
+        ma20 = float(close_s.rolling(20).mean().iloc[-1])
+        ma60 = float(close_s.rolling(60).mean().iloc[-1]) if len(close_s) >= 60 else ma20
+        high20 = float(high_s.tail(20).max())
+        low20 = float(low_s.tail(20).min())
+        atr = calc_atr14(df)
+
+        trend = "偏多" if close > ma5 > ma20 else "偏空" if close < ma5 < ma20 else "震盪"
+
+        if market == "美股":
+            entry = round(close, 2)
+            stop = round(min(low20, close - max(atr * 0.3, 0.3)), 2)
+            take_profit = round(max(high20, entry + max(entry - stop, 0.3) * 0.6), 2)
+            breakeven = "-"
+        else:
+            entry = round_by_tick(min(close, max(low20, ma20)), "nearest")
+            stop = round_by_tick(min(low20, entry - max(atr * 0.3, tick_size(close) * 3)), "down")
+            take_profit = round_by_tick(max(high20, entry + max(entry - stop, tick_size(close) * 3) * 0.6), "up")
+            cost_rate = 0.001425 * 0.6 * 2 + 0.0015
+            cost = entry * 1000 * cost_rate
+            one_tick_profit = tick_size(entry) * 1000
+            breakeven = str(max(1, math.ceil(cost / max(one_tick_profit, 1))))
+
+        return {
+            "code": str(code),
+            "name": str(name),
+            "close": close,
+            "change": change,
+            "pct": pct,
+            "ma5": ma5,
+            "ma20": ma20,
+            "ma60": ma60,
+            "high20": high20,
+            "low20": low20,
+            "atr": atr,
+            "trend": trend,
+            "entry": entry,
+            "take_profit": take_profit,
+            "stop": stop,
+            "breakeven": breakeven,
+        }
+    except Exception as e:
+        print(f"摘要圖卡資料失敗 {code}: {e}", flush=True)
+        return None
+
+def _flex_text(text, size="sm", color="#111111", weight=None, wrap=True):
+    obj = {"type": "text", "text": str(text), "size": size, "color": color, "wrap": wrap}
+    if weight:
+        obj["weight"] = weight
+    return obj
+
+def _flex_kv(label, value, color="#111111"):
+    return {
+        "type": "box",
+        "layout": "horizontal",
+        "spacing": "sm",
+        "contents": [
+            {"type": "text", "text": str(label), "size": "xs", "color": "#666666", "flex": 3},
+            {"type": "text", "text": str(value), "size": "xs", "color": color, "weight": "bold", "align": "end", "flex": 5, "wrap": True},
+        ],
+    }
+
+def make_stock_summary_flex(code, name, df, market="上市"):
+    """
+    B模式：單股查詢除了文字 + K線圖，再加一張 LINE Flex 摘要圖卡。
+    Flex 圖卡用 LINE 原生字型顯示，避免圖片中文字變成方塊。
+    """
+    if not HAS_FLEX_MENU:
+        return None
+
+    snap = build_stock_snapshot_for_card(code, name, df, market)
+    if not snap:
+        return None
+
+    trend = snap["trend"]
+    trend_color = "#d32f2f" if trend == "偏多" else "#00897b" if trend == "偏空" else "#6d4c41"
+    pct_color = "#d32f2f" if snap["pct"] >= 0 else "#00897b"
+    header_color = "#111827"
+    market_tag = "美股" if market == "美股" else "台股"
+
+    body = {
+        "type": "bubble",
+        "size": "mega",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                _flex_text("⚡ HCX-AI 單股摘要", "lg", header_color, "bold"),
+                _flex_text(f"{market_tag}｜{snap['code']} {snap['name']}", "md", "#1f2937", "bold"),
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "spacing": "sm",
+                    "contents": [
+                        {"type": "text", "text": f"現價 {fmt_price(snap['close'])}", "size": "sm", "weight": "bold", "color": "#111827", "flex": 5},
+                        {"type": "text", "text": fmt_pct(snap["pct"]), "size": "sm", "weight": "bold", "color": pct_color, "align": "end", "flex": 3},
+                    ],
+                },
+                {"type": "separator"},
+                _flex_kv("趨勢判斷", trend, trend_color),
+                _flex_kv("壓力 / 支撐", f"{fmt_price(snap['high20'])} / {fmt_price(snap['low20'])}"),
+                _flex_kv("MA5 / MA20", f"{fmt_price(snap['ma5'])} / {fmt_price(snap['ma20'])}"),
+                _flex_kv("MA60 / ATR14", f"{fmt_price(snap['ma60'])} / {fmt_price(snap['atr'])}"),
+                {"type": "separator"},
+                _flex_kv("🎯 建議進場", fmt_price(snap["entry"])),
+                _flex_kv("✅ 建議停利", fmt_price(snap["take_profit"])),
+                _flex_kv("🛑 建議停損", fmt_price(snap["stop"])),
+                _flex_kv("🔥 回本門檻", f"{snap['breakeven']} Tick" if snap["breakeven"] != "-" else "依券商成本"),
+                _flex_text("本圖卡為系統估算，不保證獲利。", "xxs", "#777777"),
+            ],
+        },
+    }
+
+    try:
+        return FlexMessage(
+            alt_text=f"HCX-AI {snap['code']} 單股摘要",
+            contents=FlexContainer.from_json(json.dumps(body, ensure_ascii=False)),
+        )
+    except Exception as e:
+        print(f"摘要圖卡建立失敗 {code}: {e}", flush=True)
+        return None
+
+def reply_text_with_images_and_card(reply_token, text, image_url="", summary_flex=None, menu=True):
+    messages = [make_text_message(text, menu)]
+    if image_url:
+        try:
+            messages.append(ImageMessage(original_content_url=image_url, preview_image_url=image_url))
+        except Exception as e:
+            print(f"圖片訊息建立失敗：{e}", flush=True)
+    if summary_flex is not None:
+        try:
+            messages.append(summary_flex)
+        except Exception as e:
+            print(f"摘要圖卡加入失敗：{e}", flush=True)
+
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.reply_message(ReplyMessageRequest(reply_token=reply_token, messages=messages[:5]))
+
 
 def reply_text_with_image(reply_token, text, image_url="", menu=True):
     messages = [make_text_message(text, menu)]
@@ -1372,25 +1525,30 @@ def handle_message(event):
             code = m.group(0)
             text = analyze_one_stock(code)
             image_url = ""
+            summary_flex = None
             try:
                 meta = get_stock_meta(code)
                 df, _ = download_daily(code, meta.get("market", "上市"), "6mo")
                 if df is not None and not df.empty:
                     image_url = make_stock_chart(code, meta.get("name", code), df)
+                    summary_flex = make_stock_summary_flex(code, meta.get("name", code), df, meta.get("market", "上市"))
             except Exception as e:
-                print(f"單股圖片處理失敗 {code}: {e}", flush=True)
-            reply_text_with_image(event.reply_token, text, image_url); return
+                print(f"單股圖片/圖卡處理失敗 {code}: {e}", flush=True)
+            reply_text_with_images_and_card(event.reply_token, text, image_url, summary_flex); return
         us_symbol = is_us_symbol_text(raw)
         if us_symbol:
             text = analyze_us_stock(us_symbol)
             image_url = ""
+            summary_flex = None
             try:
                 df, _ = download_daily(us_symbol, "美股", "6mo")
                 if df is not None and not df.empty:
-                    image_url = make_stock_chart(us_symbol, get_us_stock_meta(us_symbol).get("name", us_symbol), df)
+                    us_name = get_us_stock_meta(us_symbol).get("name", us_symbol)
+                    image_url = make_stock_chart(us_symbol, us_name, df)
+                    summary_flex = make_stock_summary_flex(us_symbol, us_name, df, "美股")
             except Exception as e:
-                print(f"美股圖片處理失敗 {us_symbol}: {e}", flush=True)
-            reply_text_with_image(event.reply_token, text, image_url); return
+                print(f"美股圖片/圖卡處理失敗 {us_symbol}: {e}", flush=True)
+            reply_text_with_images_and_card(event.reply_token, text, image_url, summary_flex); return
         reply_main_menu(event.reply_token)
     except Exception as e:
         print(f"handle_message 錯誤：{e}", flush=True); traceback.print_exc()
