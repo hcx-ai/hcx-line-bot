@@ -43,7 +43,7 @@ except Exception:
 
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-APP_VERSION = "V7.8 穩定版"
+APP_VERSION = "V7.9.1 穩定版"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
@@ -58,7 +58,10 @@ STOCK_NAME_CACHE = {"ts": 0, "map": {}}
 US_META_CACHE = {}
 TRIANGLE_AUTH_CACHE = {"ts": 0, "users": set()}
 TRIANGLE_AUTH_FILE = Path(os.environ.get("HCX_TRIANGLE_AUTH_FILE", "/tmp/hcx_triangle_auth.json"))
-TRIANGLE_PASSWORD = os.environ.get("HCX_TRIANGLE_PASSWORD", "HCX694509")
+TRIANGLE_PASSWORD = os.environ.get("HCX_TRIANGLE_PASSWORD", "694509")
+PREMIUM_PASSWORD = os.environ.get("HCX_PREMIUM_PASSWORD", TRIANGLE_PASSWORD or "694509")
+PREMIUM_PENDING_AUTH = {}
+PREMIUM_COMMANDS = {"三角收斂", "布林戰法"}
 PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://hcx-line-bot.onrender.com").rstrip("/")
 CHART_DIR = Path(os.environ.get("HCX_CHART_DIR", "/tmp/hcx_charts"))
 try:
@@ -318,6 +321,7 @@ def build_quick_reply():
         return None
     labels = [
         ("主選單", "主選單"),
+        ("布林戰", "布林戰法"),
         ("08:50沖多", "設定提醒 當沖多 08:50"),
         ("10:00沖空", "設定提醒 當沖空 10:00"),
         ("13:00隔沖", "設定提醒 隔日沖 13:00"),
@@ -364,9 +368,10 @@ def build_main_menu_flex():
             "contents": [
                 {"type": "text", "text": "⚡ HCX-AI 量子雷達", "weight": "bold", "size": "lg"},
                 {"type": "text", "text": "請直接點選下方功能", "size": "sm", "color": "#666666"},
-                _row("三角收", "三角收斂", "當沖多", "當沖多", "當沖空", "當沖空", "primary", "primary", "primary"),
-                _row("隔日沖", "隔日沖", "波段股", "波段股", "小鈴鐺", "我的提醒", "primary", "primary", "secondary"),
-                _row("提醒多", "設定提醒 當沖多 08:50", "提醒空", "設定提醒 當沖空 10:00", "提醒隔", "設定提醒 隔日沖 13:00"),
+                _row("布林戰", "布林戰法", "三角收", "三角收斂", "當沖多", "當沖多", "primary", "primary", "primary"),
+                _row("當沖空", "當沖空", "隔日沖", "隔日沖", "波段股", "波段股", "primary", "primary", "primary"),
+                _row("小鈴鐺", "我的提醒", "提醒多", "設定提醒 當沖多 08:50", "提醒空", "設定提醒 當沖空 10:00", "secondary", "secondary", "secondary"),
+                _row("提醒隔", "設定提醒 隔日沖 13:00", "會員", "會員等級", "版本", "版本"),
                 {"type": "text", "text": "也可輸入：請開機、股票代號、主選單", "size": "xs", "color": "#888888", "wrap": True},
             ],
         },
@@ -998,37 +1003,135 @@ def score_stock(code, meta, command):
     except Exception as e:
         print(f"score_stock 錯誤 {code}: {e}", flush=True); return None
 
+def _is_reasonable_price_level(level, close, down_pct=0.12, up_pct=0.16):
+    try:
+        level = float(level)
+        close = float(close)
+        if close <= 0 or level <= 0:
+            return False
+        return close * (1 - down_pct) <= level <= close * (1 + up_pct)
+    except Exception:
+        return False
+
+def _pick_near_level(levels, close, side="support", down_pct=0.08, up_pct=0.06):
+    vals = []
+    for lv in levels:
+        if _is_reasonable_price_level(lv, close, down_pct=down_pct, up_pct=up_pct):
+            vals.append(float(lv))
+    if not vals:
+        return None
+    if side == "support":
+        below = [v for v in vals if v <= close * 1.01]
+        return max(below) if below else min(vals, key=lambda x: abs(x-close))
+    else:
+        above = [v for v in vals if v >= close * 0.99]
+        return min(above) if above else min(vals, key=lambda x: abs(x-close))
+
 def build_trade_plan(row):
-    code = row["code"]; market = row.get("market","上市"); close = float(row["close"])
-    atr = float(row.get("atr") or close*0.02); kind = row.get("trade_kind","intraday_long"); t = tick_size(close)
-    support5 = row.get("low20", close-atr); resistance5 = row.get("high20", close+atr)
-    support30, resistance30 = support5, resistance5
+    """
+    V7.9.1 修正：
+    當沖多/空不可直接採用距離現價太遠的 20日低點、5分K低點或異常資料。
+    若支撐/壓力與現價差距過大，改用「現價附近」回測點，避免出現收盤199、進場100.5這種不合理價位。
+    """
+    code = row["code"]
+    market = row.get("market", "上市")
+    close = float(row["close"])
+    atr = float(row.get("atr") or close * 0.02)
+    kind = row.get("trade_kind", "intraday_long")
+    t = tick_size(close)
+
+    daily_support = row.get("low20", close - atr)
+    daily_resistance = row.get("high20", close + atr)
+    ma20 = row.get("ma20", None)
+
+    support5 = daily_support
+    resistance5 = daily_resistance
+    support30 = daily_support
+    resistance30 = daily_resistance
+
     try:
         df5 = download_intraday(code, market, "5m", "5d")
         if df5 is not None and not df5.empty:
-            recent = df5.tail(48); support5 = float(recent["Low"].min()); resistance5 = float(recent["High"].max())
-    except Exception: pass
+            recent = df5.tail(48)
+            s5 = float(pd.to_numeric(recent["Low"], errors="coerce").min())
+            r5 = float(pd.to_numeric(recent["High"], errors="coerce").max())
+            if _is_reasonable_price_level(s5, close, down_pct=0.10, up_pct=0.05):
+                support5 = s5
+            if _is_reasonable_price_level(r5, close, down_pct=0.05, up_pct=0.12):
+                resistance5 = r5
+    except Exception:
+        pass
+
     try:
         df30 = download_intraday(code, market, "30m", "10d")
         if df30 is not None and not df30.empty:
-            recent = df30.tail(10); support30 = float(recent["Low"].min()); resistance30 = float(recent["High"].max())
-    except Exception: pass
-    min_gap = max(atr*0.18, t*3)
+            recent = df30.tail(10)
+            s30 = float(pd.to_numeric(recent["Low"], errors="coerce").min())
+            r30 = float(pd.to_numeric(recent["High"], errors="coerce").max())
+            if _is_reasonable_price_level(s30, close, down_pct=0.10, up_pct=0.05):
+                support30 = s30
+            if _is_reasonable_price_level(r30, close, down_pct=0.05, up_pct=0.12):
+                resistance30 = r30
+    except Exception:
+        pass
+
+    # 當沖用的最小風控距離，不讓停損太貼，也不讓價位飛太遠。
+    min_gap = max(atr * 0.22, close * 0.006, t * 4)
+    max_pullback = max(t * 2, min(atr * 0.18, close * 0.012))
+
     if kind == "triangle":
-        entry = row.get("breakout_price") or resistance5
-        stop = row.get("defense_price") or support5
-        entry = round_by_tick(float(entry), "up")
-        stop = round_by_tick(float(stop), "down")
+        entry_raw = row.get("breakout_price") or _pick_near_level([resistance5, resistance30, daily_resistance], close, "resistance", down_pct=0.04, up_pct=0.18) or close
+        stop_raw = row.get("defense_price") or _pick_near_level([support5, support30, daily_support, ma20], close, "support", down_pct=0.12, up_pct=0.04)
+        entry = round_by_tick(float(entry_raw), "up")
+        if stop_raw is None or float(stop_raw) < close * 0.86:
+            stop_raw = entry - max(min_gap, close * 0.018)
+        stop = round_by_tick(float(stop_raw), "down")
         take = round_by_tick(entry + max(entry - stop, min_gap) * 1.20, "up")
+
     elif kind == "intraday_short":
-        entry = round_by_tick(min(close, support5), "down")
-        stop = round_by_tick(max(resistance30, entry + min_gap), "up")
-        take = round_by_tick(entry - max(stop-entry, min_gap)*0.60, "down")
+        near_res = _pick_near_level([resistance5, resistance30, daily_resistance, ma20], close, "resistance", down_pct=0.04, up_pct=0.08)
+        near_sup = _pick_near_level([support5, support30, daily_support], close, "support", down_pct=0.10, up_pct=0.03)
+
+        entry_raw = close if near_res is None else min(max(close, near_res), close * 1.035)
+        entry = round_by_tick(entry_raw, "nearest")
+        stop = round_by_tick(entry + max(min_gap, close * 0.012), "up")
+
+        target_raw = near_sup if near_sup is not None else entry - max(stop - entry, min_gap) * 0.85
+        take = round_by_tick(min(target_raw, entry - t * 2), "down")
+
     else:
-        entry = round_by_tick(min(close, max(support5, support30)), "nearest")
-        stop = round_by_tick(min(support30, entry - min_gap), "down")
-        take = round_by_tick(max(resistance5, entry + max(entry-stop, min_gap)*0.60), "up")
-    row.update({"entry":entry,"stop":stop,"take_profit":take,"tick_line":calc_tick_profit_info(entry, take)})
+        # 當沖多：只選現價附近的支撐。太遠的支撐視為波段支撐，不可當作當沖進場價。
+        near_sup = _pick_near_level([support5, support30, daily_support, ma20], close, "support", down_pct=0.08, up_pct=0.03)
+        near_res = _pick_near_level([resistance5, resistance30, daily_resistance], close, "resistance", down_pct=0.03, up_pct=0.10)
+
+        if near_sup is not None:
+            entry_raw = min(close, max(float(near_sup), close - max_pullback))
+        else:
+            entry_raw = close - max_pullback
+
+        entry = round_by_tick(entry_raw, "nearest")
+        stop = round_by_tick(entry - max(min_gap, close * 0.012), "down")
+
+        target_raw = near_res if near_res is not None else entry + max(entry - stop, min_gap) * 0.90
+        take = round_by_tick(max(target_raw, entry + t * 2), "up")
+
+    # 最後防呆：若價位仍離現價太誇張，改回現價附近。
+    if kind != "triangle" and abs(float(entry) - close) / max(close, 1) > 0.08:
+        if kind == "intraday_short":
+            entry = round_by_tick(close, "nearest")
+            stop = round_by_tick(entry + max(min_gap, close * 0.012), "up")
+            take = round_by_tick(entry - max(min_gap, close * 0.012) * 0.85, "down")
+        else:
+            entry = round_by_tick(close - max_pullback, "nearest")
+            stop = round_by_tick(entry - max(min_gap, close * 0.012), "down")
+            take = round_by_tick(entry + max(entry - stop, min_gap) * 0.90, "up")
+
+    row.update({
+        "entry": entry,
+        "stop": stop,
+        "take_profit": take,
+        "tick_line": calc_tick_profit_info(entry, take)
+    })
     return row
 
 def run_quantum_scan(command):
@@ -1074,6 +1177,7 @@ def format_quantum_report(command, rows):
         "隔日沖": "🟠 隔日沖 TOP 5",
         "波段股": "🟦 波段股 TOP 5",
         "三角收斂": "🔺 三角收斂 TOP 5",
+        "布林戰法": "📈 布林戰法 TOP 5",
     }
     if not rows:
         return f"""⚡ HCX-AI量子雷達
@@ -1122,6 +1226,256 @@ def format_quantum_report(command, rows):
         "⚠️ 當沖請配合1分K轉折、盤中量能與紀律停損。",
     ]
     return "\n".join(lines)[:4800]
+
+
+# 布林戰法選股
+
+def boll_add_bbands(df, n=20, k=2.0):
+    d = df.copy()
+    close = pd.to_numeric(d["Close"], errors="coerce")
+    mid = close.rolling(n).mean()
+    std = close.rolling(n).std(ddof=0)
+    d["BB_MID"] = mid
+    d["BB_UP"] = mid + k * std
+    d["BB_LOW"] = mid - k * std
+    d["BB_W"] = (d["BB_UP"] - d["BB_LOW"]) / d["BB_MID"].replace(0, np.nan)
+    return d
+
+def boll_slope_pct(series, lb=5):
+    try:
+        s = pd.to_numeric(series, errors="coerce").dropna()
+        if len(s) < lb + 1:
+            return 0.0
+        seg = s.iloc[-(lb + 1):]
+        base = float(seg.iloc[0])
+        if base == 0 or not math.isfinite(base):
+            return 0.0
+        return float(seg.iloc[-1] - seg.iloc[0]) / abs(base)
+    except Exception:
+        return 0.0
+
+def boll_is_opening_up(d, lb=5, slope_min=0.0015):
+    try:
+        up1 = boll_slope_pct(d["BB_UP"], lb) > slope_min
+        up2 = boll_slope_pct(d["BB_MID"], lb) > slope_min
+        up3 = boll_slope_pct(d["BB_LOW"], lb) > slope_min
+        widen = float(d["BB_W"].iloc[-1]) > float(d["BB_W"].iloc[-(lb + 1)])
+        return up1 and up2 and up3 and widen
+    except Exception:
+        return False
+
+def boll_is_opening_down(d, lb=5, slope_min=0.0015):
+    try:
+        dn1 = boll_slope_pct(d["BB_UP"], lb) < -slope_min
+        dn2 = boll_slope_pct(d["BB_MID"], lb) < -slope_min
+        dn3 = boll_slope_pct(d["BB_LOW"], lb) < -slope_min
+        widen = float(d["BB_W"].iloc[-1]) > float(d["BB_W"].iloc[-(lb + 1)])
+        return dn1 and dn2 and dn3 and widen
+    except Exception:
+        return False
+
+def boll_signal_buy_mid(d, tol=0.005, bars=3):
+    try:
+        x = d.iloc[-(bars + 1):].copy()
+        mid = x["BB_MID"]
+        close = x["Close"]
+        low = x["Low"]
+        touched_mid = (low <= mid * (1 + tol)).any()
+        cross_up = (close.iloc[-2] < mid.iloc[-2]) and (close.iloc[-1] >= mid.iloc[-1])
+        near_mid_today = abs(float(close.iloc[-1]) / max(float(mid.iloc[-1]), 0.01) - 1) <= tol
+        return bool(touched_mid and (cross_up or near_mid_today))
+    except Exception:
+        return False
+
+def boll_signal_buy_low(d, tol=0.005, bars=3):
+    try:
+        x = d.iloc[-(bars + 1):].copy()
+        lowband = x["BB_LOW"]
+        close = x["Close"]
+        low = x["Low"]
+        touched_low = (low <= lowband * (1 + tol)).any()
+        rebound = close.iloc[-1] > lowband.iloc[-1]
+        return bool(touched_low and rebound)
+    except Exception:
+        return False
+
+def boll_bw_label(bw_pct):
+    try:
+        bw = float(bw_pct)
+        if bw < 8: return "🧊 很低"
+        if bw < 15: return "🔥 低"
+        if bw < 25: return "🔥🔥 中"
+        return "🚀 高"
+    except Exception:
+        return ""
+
+def score_bollinger_stock(code, meta):
+    try:
+        df, _ = download_daily(code, meta.get("market", "上市"), "1y")
+        if df is None or df.empty or len(df) < 45:
+            return None
+
+        d = boll_add_bbands(df, 20, 2.0).dropna()
+        if len(d) < 28:
+            return None
+
+        last = d.iloc[-1]
+        close = float(last["Close"])
+        bb_up = float(last["BB_UP"])
+        bb_mid = float(last["BB_MID"])
+        bb_low = float(last["BB_LOW"])
+        bbw_pct = float(last["BB_W"]) * 100.0
+        if bbw_pct < 3.0:
+            return None
+
+        up = boll_is_opening_up(d)
+        down = boll_is_opening_down(d)
+        if not (up or down):
+            return None
+
+        vol_s = pd.to_numeric(d["Volume"], errors="coerce")
+        vol_ma20 = float(vol_s.rolling(20).mean().iloc[-1]) if len(vol_s) >= 20 else max(float(vol_s.iloc[-1]), 1)
+        vol_ratio = float(vol_s.iloc[-1]) / max(vol_ma20, 1)
+
+        signal = ""
+        note = ""
+        kind = ""
+        entry = take = stop = None
+
+        if close > bb_up:
+            signal = "突破上軌警戒"
+            note = "股價突破上軌，偏短線過熱，適合列入停利/警戒觀察。"
+            kind = "sell_watch"
+            entry = round_by_tick(close, "nearest")
+            take = round_by_tick(close, "nearest")
+            stop = round_by_tick(bb_mid, "down")
+            base_score = 58 + min(bbw_pct, 35) * 0.8 + min(vol_ratio, 3) * 4
+        elif up and boll_signal_buy_mid(d):
+            signal = "多：買中軌→上軌"
+            note = "三線開口向上，回踩靠近中軌後轉強。"
+            kind = "long_mid"
+            entry = round_by_tick(bb_mid, "nearest")
+            take = round_by_tick(bb_up, "up")
+            stop = round_by_tick(bb_low, "down")
+            close_to_mid = abs(close / max(bb_mid, 0.01) - 1)
+            base_score = 72 + min(bbw_pct, 35) * 0.55 + min(vol_ratio, 3) * 5 - close_to_mid * 600
+        elif down and boll_signal_buy_low(d):
+            signal = "弱：買下軌→中軌"
+            note = "三線開口向下，觸下軌後反彈，屬弱勢反彈型。"
+            kind = "weak_rebound"
+            entry = round_by_tick(bb_low, "nearest")
+            take = round_by_tick(bb_mid, "up")
+            stop = round_by_tick(min(float(d["Low"].tail(10).min()), bb_low * 0.98), "down")
+            base_score = 62 + min(bbw_pct, 35) * 0.45 + min(vol_ratio, 3) * 4
+        else:
+            return None
+
+        pct = 0.0
+        try:
+            prev = float(d["Close"].iloc[-2])
+            pct = (close - prev) / prev * 100 if prev else 0
+        except Exception:
+            pass
+
+        return {
+            "code": code,
+            "name": meta.get("name", code),
+            "market": meta.get("market", "上市"),
+            "close": close,
+            "pct": pct,
+            "bb_up": bb_up,
+            "bb_mid": bb_mid,
+            "bb_low": bb_low,
+            "bbw_pct": bbw_pct,
+            "vol_ratio": vol_ratio,
+            "signal": signal,
+            "note": note,
+            "kind": kind,
+            "entry": entry,
+            "take_profit": take,
+            "stop": stop,
+            "rank_score": round(float(clip(base_score, 0, 100)), 1),
+            "tick_line": calc_tick_profit_info(entry or close, take or close),
+        }
+    except Exception as e:
+        print(f"布林戰法評分失敗 {code}: {e}", flush=True)
+        return None
+
+def run_bollinger_scan():
+    universe = fetch_market_universe()
+    deep_n = max(60, min(safe_int(os.environ.get("HCX_BOLL_DEEP_SCAN", 220), 220), 280))
+    candidates = universe[:deep_n]
+    rows = []
+    workers = max(3, min(safe_int(os.environ.get("HCX_WORKERS", 8), 8), 10))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = []
+        for item in candidates:
+            meta = {"name": item.get("name"), "market": item.get("market", "上市")}
+            futures.append(executor.submit(score_bollinger_stock, item["code"], meta))
+        for fut in as_completed(futures):
+            try:
+                r = fut.result()
+                if r is not None:
+                    rows.append(r)
+            except Exception as e:
+                print(f"布林候選股失敗：{e}", flush=True)
+
+    rows = sorted(rows, key=lambda x: (float(x.get("rank_score") or 0), float(x.get("vol_ratio") or 0)), reverse=True)
+    return format_bollinger_report(rows[:12])
+
+def format_bollinger_report(rows):
+    if not rows:
+        return f"""⚡ HCX-AI量子雷達
+🕒 時間：{query_time_text()}
+📌 指令：布林戰法
+
+本次暫無符合布林戰法的股票。
+可稍後盤中再查，或等待布林通道開口與回踩訊號更明確。"""
+
+    main_rows = [r for r in rows if r.get("kind") != "sell_watch"][:5]
+    sell_rows = [r for r in rows if r.get("kind") == "sell_watch"][:5]
+    if not main_rows:
+        main_rows = rows[:5]
+
+    labels = ["A", "B", "C", "D", "E"]
+    lines = [
+        "⚡ HCX-AI量子雷達",
+        f"🕒 時間：{query_time_text()}",
+        "📈 布林戰法 TOP 5",
+        "━━━━━━━━━━━━━━",
+    ]
+
+    for i, r in enumerate(main_rows[:5]):
+        label = labels[i] if i < len(labels) else chr(65+i)
+        lines.append(
+            f"{label}. {r['code']} {r['name']}｜{r.get('signal','')}｜{boll_bw_label(r.get('bbw_pct'))}\n"
+            f"   收盤 {fmt_price(r['close'])}｜漲跌 {fmt_pct(r.get('pct',0))}｜量比 {float(r.get('vol_ratio') or 0):.2f}\n"
+            f"   中軌 {fmt_price(r.get('bb_mid'))}｜上軌 {fmt_price(r.get('bb_up'))}｜下軌 {fmt_price(r.get('bb_low'))}\n"
+            f"   📏 帶寬 {float(r.get('bbw_pct') or 0):.2f}%｜職業評分 {float(r.get('rank_score') or 0):.1f}\n"
+            f"   🎯 觀察買點：{fmt_price(r.get('entry'))}\n"
+            f"   ✅ 第一目標：{fmt_price(r.get('take_profit'))}\n"
+            f"   🛑 防守價：{fmt_price(r.get('stop'))}\n"
+            f"   🧭 {r.get('note','')}"
+        )
+
+    if sell_rows:
+        lines += ["━━━━━━━━━━━━━━", "🟢 突破上軌警戒"]
+        for i, r in enumerate(sell_rows[:5], start=1):
+            lines.append(
+                f"{i}. {r['code']} {r['name']}｜收盤 {fmt_price(r['close'])}｜上軌 {fmt_price(r.get('bb_up'))}｜帶寬 {float(r.get('bbw_pct') or 0):.2f}%"
+            )
+
+    lines += [
+        "━━━━━━━━━━━━━━",
+        "⚠️ 布林戰法為技術型態篩選，不保證獲利。",
+        "⚠️ 請搭配成交量、1分K轉折與紀律停損。",
+    ]
+    return "\\n".join(lines)[:4800]
+
+def run_command_scan(command):
+    if command == "布林戰法":
+        return run_bollinger_scan()
+    return run_quantum_scan(command)
 
 
 # 單檔分析
@@ -1249,6 +1603,7 @@ def normalize_text(text):
 
 def detect_quantum_command(text):
     t = normalize_text(text)
+    if any(w in t for w in ["布林戰法","布林選股","布林通道","布林股","BOLL","boll","布林"]): return "布林戰法"
     if any(w in t for w in ["三角收斂","三角整理","收斂股","三角選股","三角型態"]): return "三角收斂"
     if any(w in t for w in ["波段股","波段","中線股","中線","波段選股"]): return "波段股"
     if any(w in t for w in ["當沖股","當衝股","最佳當沖","今日當沖"]): return "當沖股"
@@ -1280,21 +1635,59 @@ def save_triangle_users(users):
     except Exception as e:
         print(f"儲存三角收斂權限失敗：{e}", flush=True)
 
-def is_triangle_authorized(user_id):
+def is_premium_authorized(user_id):
     return str(user_id) in load_triangle_users() or is_advanced_user(str(user_id))
 
-def handle_triangle_password(user_id, raw_text):
+def is_triangle_authorized(user_id):
+    return is_premium_authorized(user_id)
+
+def set_pending_premium_command(user_id, command):
+    if user_id and command:
+        PREMIUM_PENDING_AUTH[str(user_id)] = {"command": command, "ts": time.time()}
+
+def pop_pending_premium_command(user_id):
+    item = PREMIUM_PENDING_AUTH.pop(str(user_id), None)
+    if not item:
+        return ""
+    if time.time() - float(item.get("ts", 0)) > 600:
+        return ""
+    return item.get("command", "")
+
+def _premium_password_ok(raw_text):
     txt = str(raw_text or "").strip()
     compact = normalize_text(txt)
-    if TRIANGLE_PASSWORD and (TRIANGLE_PASSWORD in txt or compact == normalize_text(TRIANGLE_PASSWORD)):
-        users = load_triangle_users()
-        users.add(str(user_id))
-        save_triangle_users(users)
-        return "✅ 三角收斂功能已開通\n請輸入：三角收斂"
-    return ""
+    candidates = {
+        normalize_text(PREMIUM_PASSWORD),
+        normalize_text(TRIANGLE_PASSWORD),
+        "694509",
+        "HCX694509",
+    }
+    candidates = {x for x in candidates if x}
+    if compact in candidates:
+        return True
+    # 允許會員回覆「密碼 694509」「專屬密碼694509」
+    return any(pw in compact for pw in ["694509", "HCX694509"])
+
+def handle_premium_password(user_id, raw_text):
+    if not _premium_password_ok(raw_text):
+        return "", ""
+    users = load_triangle_users()
+    users.add(str(user_id))
+    save_triangle_users(users)
+    pending = pop_pending_premium_command(user_id)
+    if pending:
+        return f"✅ 專屬密碼正確，已開通付費功能\n即將執行：{pending}", pending
+    return "✅ 專屬密碼正確，已開通付費功能\n可使用：三角收斂、布林戰法", ""
+
+def handle_triangle_password(user_id, raw_text):
+    msg, _cmd = handle_premium_password(user_id, raw_text)
+    return msg
+
+def premium_password_message(command="付費功能"):
+    return f"🔒 {command} 為付費功能\n請直接回覆專屬密碼後再使用。"
 
 def triangle_password_message():
-    return "🔒 三角收斂為付費功能\n請輸入專屬密碼後再使用。"
+    return premium_password_message("三角收斂")
 
 
 def help_message():
@@ -1313,6 +1706,7 @@ def help_message():
 🟠 隔日沖
 🟦 波段股
 🔺 三角收斂（付費）
+📈 布林戰法（付費）
 
 觸控選單：
 🔳 主選單
@@ -1367,6 +1761,7 @@ def reminder_help():
 設定提醒 當沖多 08:50
 設定提醒 當沖空 10:00
 設定提醒 隔日沖 13:00
+設定提醒 布林戰法 09:10
 
 查詢：我的提醒
 取消：取消提醒 當沖多
@@ -1422,7 +1817,7 @@ def due_reminders_now():
 def run_due_reminders():
     for cmd, users in due_reminders_now().items():
         try:
-            result = run_quantum_scan(cmd)
+            result = run_command_scan(cmd)
             text = f"⏰ HCX-AI 自動提醒｜{cmd}\n🕒 {query_time_text()}\n\n{result}"
             for uid in users:
                 if is_authorized_user(uid): push_long_text(uid, text)
@@ -1448,7 +1843,7 @@ def start_reminder_loop():
 def start_scan_async(user_id, command):
     def job():
         try:
-            with SCAN_LOCK: result = run_quantum_scan(command)
+            with SCAN_LOCK: result = run_command_scan(command)
             push_long_text(user_id, result)
         except Exception as e:
             print(f"背景掃描失敗 {command}: {e}", flush=True); traceback.print_exc()
@@ -1459,7 +1854,7 @@ def start_scan_async(user_id, command):
 
 系統正在啟動 HCX-AI 量子雷達篩選中...
 
-📊 掃描模式：選股日報核心 TOP 5
+📊 掃描模式：HCX-AI 策略 TOP 5
 🕒 時間：{query_time_text()}
 
 稍後會自動推播結果給你。"""
@@ -1495,9 +1890,12 @@ def handle_message(event):
     try:
         if not is_authorized_user(user_id):
             reply_text(event.reply_token, member_block_message(user_id), menu=False); return
-        pw_msg = handle_triangle_password(user_id, raw)
+        pw_msg, pw_command = handle_premium_password(user_id, raw)
         if pw_msg:
-            reply_text(event.reply_token, pw_msg)
+            if pw_command:
+                reply_text(event.reply_token, pw_msg + "\n\n" + start_scan_async(user_id, pw_command))
+            else:
+                reply_text(event.reply_token, pw_msg)
             return
         reminder_cmd = parse_reminder_command(raw); quantum_cmd = detect_quantum_command(raw)
         if msg in ["主選單", "選單", "功能選單", "menu", "MENU"]:
@@ -1516,8 +1914,9 @@ def handle_message(event):
         if reminder_cmd:
             reply_text(event.reply_token, handle_reminder(user_id, reminder_cmd)); return
         if quantum_cmd:
-            if quantum_cmd == "三角收斂" and not is_triangle_authorized(user_id):
-                reply_text(event.reply_token, triangle_password_message())
+            if quantum_cmd in PREMIUM_COMMANDS and not is_premium_authorized(user_id):
+                set_pending_premium_command(user_id, quantum_cmd)
+                reply_text(event.reply_token, premium_password_message(quantum_cmd))
                 return
             reply_text(event.reply_token, start_scan_async(user_id, quantum_cmd)); return
         m = re.search(r"\d{4}", msg)
