@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-HCX-AI LINE 股票推播雷達 V7.0 穩定版
-功能：股票查詢、當沖股/當沖多/當沖空/隔日沖、會員限制、會員自訂提醒、LINE 觸控式快速選單。
+HCX-AI LINE 股票推播雷達 V7.9.4 穩定版
+功能：股票查詢、當沖多/當沖空/隔日沖、波段股、三角收斂、布林戰法、會員限制、會員提醒、LINE 觸控式快速選單。
 Render Start Command：gunicorn app:app --bind 0.0.0.0:$PORT
 """
 
@@ -43,7 +43,7 @@ except Exception:
 
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-APP_VERSION = "V7.9.1 穩定版"
+APP_VERSION = "V7.9.4 穩定版"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 app = Flask(__name__)
 configuration = Configuration(access_token=os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", ""))
@@ -59,9 +59,18 @@ US_META_CACHE = {}
 TRIANGLE_AUTH_CACHE = {"ts": 0, "users": set()}
 TRIANGLE_AUTH_FILE = Path(os.environ.get("HCX_TRIANGLE_AUTH_FILE", "/tmp/hcx_triangle_auth.json"))
 TRIANGLE_PASSWORD = os.environ.get("HCX_TRIANGLE_PASSWORD", "694509")
-PREMIUM_PASSWORD = os.environ.get("HCX_PREMIUM_PASSWORD", TRIANGLE_PASSWORD or "694509")
+BOLL_PASSWORD = os.environ.get("HCX_BOLL_PASSWORD", "694521")
+try:
+    PREMIUM_SESSION_TTL = int(float(os.environ.get("HCX_PREMIUM_SESSION_SECONDS", 900)))
+except Exception:
+    PREMIUM_SESSION_TTL = 900
 PREMIUM_PENDING_AUTH = {}
+PREMIUM_SESSION_AUTH = {}
 PREMIUM_COMMANDS = {"三角收斂", "布林戰法"}
+PREMIUM_PASSWORD_MAP = {
+    "三角收斂": TRIANGLE_PASSWORD,
+    "布林戰法": BOLL_PASSWORD,
+}
 PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://hcx-line-bot.onrender.com").rstrip("/")
 CHART_DIR = Path(os.environ.get("HCX_CHART_DIR", "/tmp/hcx_charts"))
 try:
@@ -341,21 +350,62 @@ def _flex_button(label, text, style="secondary"):
 
 def build_main_menu_flex():
     """
-    V7.5 九宮格快捷鍵：3欄 x 3列，共9個功能，每格都有標題。
+    V7.9.4 柔和亮彩圖卡選單：
+    1. 色彩改成亮彩柔和版，不再灰暗。
+    2. 取消容易顯示成方塊的特殊 emoji，改用文字標籤。
+    3. 維持 LINE Flex Message 互動點選功能。
     """
     if not HAS_FLEX_MENU:
         return None
 
-    def _row(a1, t1, a2, t2, a3, t3, s1="secondary", s2="secondary", s3="secondary"):
+    def card(code, title, subtitle, text, bg="#FFFFFF", fg="#1F2937", sub="#64748B", bd="#E2E8F0"):
+        return {
+            "type": "box",
+            "layout": "vertical",
+            "cornerRadius": "18px",
+            "paddingAll": "13px",
+            "backgroundColor": bg,
+            "borderColor": bd,
+            "borderWidth": "1px",
+            "action": {"type": "message", "label": title[:20], "text": text},
+            "contents": [
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "spacing": "sm",
+                    "contents": [
+                        {
+                            "type": "box",
+                            "layout": "vertical",
+                            "cornerRadius": "999px",
+                            "width": "38px",
+                            "height": "38px",
+                            "backgroundColor": "#FFFFFFAA",
+                            "justifyContent": "center",
+                            "alignItems": "center",
+                            "contents": [
+                                {"type": "text", "text": code, "size": "xs", "weight": "bold", "color": fg, "align": "center"}
+                            ],
+                        },
+                        {
+                            "type": "box",
+                            "layout": "vertical",
+                            "contents": [
+                                {"type": "text", "text": title, "size": "md", "weight": "bold", "color": fg, "wrap": True},
+                                {"type": "text", "text": subtitle, "size": "xxs", "color": sub, "wrap": True},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+    def row(left, right):
         return {
             "type": "box",
             "layout": "horizontal",
-            "spacing": "xs",
-            "contents": [
-                _flex_button(a1, t1, s1),
-                _flex_button(a2, t2, s2),
-                _flex_button(a3, t3, s3),
-            ],
+            "spacing": "sm",
+            "contents": [left, right],
         }
 
     bubble = {
@@ -365,26 +415,59 @@ def build_main_menu_flex():
             "type": "box",
             "layout": "vertical",
             "spacing": "md",
+            "backgroundColor": "#FFF7ED",
+            "paddingAll": "18px",
             "contents": [
-                {"type": "text", "text": "⚡ HCX-AI 量子雷達", "weight": "bold", "size": "lg"},
-                {"type": "text", "text": "請直接點選下方功能", "size": "sm", "color": "#666666"},
-                _row("布林戰", "布林戰法", "三角收", "三角收斂", "當沖多", "當沖多", "primary", "primary", "primary"),
-                _row("當沖空", "當沖空", "隔日沖", "隔日沖", "波段股", "波段股", "primary", "primary", "primary"),
-                _row("小鈴鐺", "我的提醒", "提醒多", "設定提醒 當沖多 08:50", "提醒空", "設定提醒 當沖空 10:00", "secondary", "secondary", "secondary"),
-                _row("提醒隔", "設定提醒 隔日沖 13:00", "會員", "會員等級", "版本", "版本"),
-                {"type": "text", "text": "也可輸入：請開機、股票代號、主選單", "size": "xs", "color": "#888888", "wrap": True},
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "cornerRadius": "22px",
+                    "paddingAll": "16px",
+                    "backgroundColor": "#FFE4E6",
+                    "contents": [
+                        {"type": "text", "text": "HCX-AI 量子雷達", "weight": "bold", "size": "xl", "color": "#7F1D1D"},
+                        {"type": "text", "text": "選擇策略，系統會自動回覆結果", "size": "xs", "color": "#9F1239", "wrap": True},
+                    ],
+                },
+                row(
+                    card("BB", "布林戰法", "中軌/下軌/上軌警戒", "布林戰法", "#FED7AA", "#7C2D12", "#9A3412", "#FDBA74"),
+                    card("TR", "三角收斂", "週K方向＋日K型態", "三角收斂", "#FBCFE8", "#831843", "#9D174D", "#F9A8D4"),
+                ),
+                row(
+                    card("UP", "當沖多", "偏多短打 TOP 5", "當沖多", "#FECACA", "#7F1D1D", "#991B1B", "#FCA5A5"),
+                    card("DN", "當沖空", "偏空短打 TOP 5", "當沖空", "#BBF7D0", "#064E3B", "#047857", "#86EFAC"),
+                ),
+                row(
+                    card("NX", "隔日沖", "隔日觀察清單", "隔日沖", "#FDE68A", "#78350F", "#92400E", "#FCD34D"),
+                    card("SW", "波段股", "波段趨勢清單", "波段股", "#BFDBFE", "#1E3A8A", "#1D4ED8", "#93C5FD"),
+                ),
+                row(
+                    card("AL", "小鈴鐺", "查看我的提醒", "我的提醒", "#E9D5FF", "#4C1D95", "#6D28D9", "#D8B4FE"),
+                    card("VIP", "會員等級", "查看權限狀態", "會員等級", "#DDD6FE", "#312E81", "#4338CA", "#C4B5FD"),
+                ),
+                {"type": "separator", "color": "#FDBA74"},
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "spacing": "xs",
+                    "contents": [
+                        _flex_button("提醒多", "設定提醒 當沖多 08:50"),
+                        _flex_button("提醒空", "設定提醒 當沖空 10:00"),
+                        _flex_button("提醒隔", "設定提醒 隔日沖 13:00"),
+                    ],
+                },
+                {"type": "text", "text": "也可直接輸入：2330、AAPL、請開機、版本", "size": "xxs", "color": "#9A3412", "wrap": True},
             ],
         },
     }
     try:
         return FlexMessage(
-            alt_text="HCX-AI 九宮格快捷鍵",
+            alt_text="HCX-AI 柔和亮彩策略選單",
             contents=FlexContainer.from_json(json.dumps(bubble, ensure_ascii=False)),
         )
     except Exception as e:
         print(f"Flex選單建立失敗：{e}", flush=True)
         return None
-
 
 
 def reply_main_menu(reply_token):
@@ -716,16 +799,58 @@ def guess_field(row, keys):
         if any(str(t).lower() in ks for t in keys): return v
     return None
 
+def _parse_isin_rows_to_name_map(url, market):
+    """
+    從臺灣 ISIN 公開頁解析股票代號與名稱。
+    strMode=2 上市、strMode=4 上櫃、strMode=5 興櫃。
+    這裡只建立名稱快取，不保證每一檔 yfinance 都有可下載K線。
+    """
+    mp = {}
+    try:
+        r = SESSION.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 HCX-AI-LineBot/7.9"},
+            timeout=15
+        )
+        r.raise_for_status()
+        try:
+            tables = pd.read_html(r.text)
+        except Exception:
+            tables = pd.read_html(r.content)
+        for tb in tables:
+            if tb is None or tb.empty:
+                continue
+            for _, row in tb.iterrows():
+                cells = [str(x).strip() for x in row.tolist()]
+                joined = " ".join(cells)
+                m = re.search(r"\b(\d{4})[\s　]+([^\s　]+)", joined)
+                if not m:
+                    continue
+                code, name = m.group(1), m.group(2)
+                if is_common_stock(code, name):
+                    mp[code] = {"name": name, "market": market}
+    except Exception as e:
+        print(f"{market} ISIN 名稱抓取失敗：{e}", flush=True)
+    return mp
+
 def fetch_taiwan_stock_name_map(force=False):
     """
-    上市 + 上櫃完整名稱快取。
-    目的：單股查詢時不再受 TOP 600 掃描名單限制，避免 6153 這類股票名稱顯示成代號。
+    V7.9.2 名稱快取強化：
+    1. 優先抓 TWSE 上市公開資料。
+    2. 再抓 TPEx 上櫃公開資料。
+    3. 補抓 ISIN：上市 + 上櫃 + 興櫃。
+    4. 最後才使用少量內建必要備援表。
+
+    注意：美股名稱不適合全部硬塞進程式，數量太多也會讓部署變慢；
+    美股採「查詢當下用 yfinance 取得名稱」並快取。
     """
     now = time.time()
     if not force and STOCK_NAME_CACHE.get("map") and now - STOCK_NAME_CACHE.get("ts", 0) < 21600:
         return STOCK_NAME_CACHE["map"]
 
     mp = {}
+
+    # 上市：TWSE OpenAPI
     try:
         r = SESSION.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=12)
         r.raise_for_status()
@@ -739,6 +864,7 @@ def fetch_taiwan_stock_name_map(force=False):
     except Exception as e:
         print(f"上市名稱快取失敗：{e}", flush=True)
 
+    # 上櫃：TPEx OpenAPI
     try:
         r = SESSION.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", timeout=12)
         r.raise_for_status()
@@ -752,11 +878,19 @@ def fetch_taiwan_stock_name_map(force=False):
     except Exception as e:
         print(f"上櫃名稱快取失敗：{e}", flush=True)
 
-    extra = dict(FALLBACK_STOCKS)
-    extra.update({
-        "6153": "嘉聯益",
-    })
-    for code, name in extra.items():
+    # ISIN 備援：補齊上市/上櫃/興櫃名稱，尤其是興櫃
+    isin_sources = [
+        ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", "上市"),
+        ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", "上櫃"),
+        ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=5", "興櫃"),
+    ]
+    for url, market in isin_sources:
+        isin_mp = _parse_isin_rows_to_name_map(url, market)
+        for code, meta in isin_mp.items():
+            mp.setdefault(code, meta)
+
+    # 少量必要備援：避免官方端短暫失敗時，常用股票仍能顯示中文名
+    for code, name in dict(FALLBACK_STOCKS).items():
         if re.fullmatch(r"\d{4}", str(code)) and code not in mp:
             mp[str(code)] = {"name": name, "market": "上市"}
 
@@ -865,7 +999,9 @@ def get_stock_meta(code):
 def yahoo_symbols(code, market="上市"):
     if market == "美股":
         return [str(code).upper()]
-    return [f"{code}.TWO", f"{code}.TW"] if market == "上櫃" else [f"{code}.TW", f"{code}.TWO"]
+    if market in ["上櫃", "興櫃"]:
+        return [f"{code}.TWO", f"{code}.TW", str(code)]
+    return [f"{code}.TW", f"{code}.TWO", str(code)]
 
 def normalize_yf_df(df):
     if df is None or df.empty: return None
@@ -1635,15 +1771,61 @@ def save_triangle_users(users):
     except Exception as e:
         print(f"儲存三角收斂權限失敗：{e}", flush=True)
 
-def is_premium_authorized(user_id):
-    return str(user_id) in load_triangle_users() or is_advanced_user(str(user_id))
+def _strategy_password(command):
+    return normalize_text(PREMIUM_PASSWORD_MAP.get(command, ""))
+
+def _strategy_by_password(raw_text):
+    txt = normalize_text(raw_text)
+    if not txt:
+        return ""
+    for command, password in PREMIUM_PASSWORD_MAP.items():
+        pw = normalize_text(password)
+        if not pw:
+            continue
+        if txt == pw or txt == normalize_text("密碼" + pw) or txt == normalize_text("專屬密碼" + pw):
+            return command
+        if pw in txt and len(txt) <= len(pw) + 8:
+            return command
+    return ""
+
+def _session_key(user_id, command):
+    return f"{user_id}:{command}"
+
+def grant_premium_session(user_id, command):
+    if not user_id or not command:
+        return
+    PREMIUM_SESSION_AUTH[_session_key(str(user_id), command)] = time.time() + PREMIUM_SESSION_TTL
+
+def premium_session_remaining(user_id, command):
+    exp = float(PREMIUM_SESSION_AUTH.get(_session_key(str(user_id), command), 0))
+    remain = exp - time.time()
+    if remain <= 0:
+        PREMIUM_SESSION_AUTH.pop(_session_key(str(user_id), command), None)
+        return 0
+    return int(remain)
+
+def is_premium_authorized(user_id, command=None):
+    if is_advanced_user(str(user_id)):
+        return True
+    if command:
+        return premium_session_remaining(user_id, command) > 0
+    return any(premium_session_remaining(user_id, cmd) > 0 for cmd in PREMIUM_COMMANDS)
 
 def is_triangle_authorized(user_id):
-    return is_premium_authorized(user_id)
+    return is_premium_authorized(user_id, "三角收斂")
 
 def set_pending_premium_command(user_id, command):
     if user_id and command:
         PREMIUM_PENDING_AUTH[str(user_id)] = {"command": command, "ts": time.time()}
+
+def peek_pending_premium_command(user_id):
+    item = PREMIUM_PENDING_AUTH.get(str(user_id))
+    if not item:
+        return ""
+    if time.time() - float(item.get("ts", 0)) > 600:
+        PREMIUM_PENDING_AUTH.pop(str(user_id), None)
+        return ""
+    return item.get("command", "")
 
 def pop_pending_premium_command(user_id):
     item = PREMIUM_PENDING_AUTH.pop(str(user_id), None)
@@ -1653,38 +1835,46 @@ def pop_pending_premium_command(user_id):
         return ""
     return item.get("command", "")
 
-def _premium_password_ok(raw_text):
-    txt = str(raw_text or "").strip()
-    compact = normalize_text(txt)
-    candidates = {
-        normalize_text(PREMIUM_PASSWORD),
-        normalize_text(TRIANGLE_PASSWORD),
-        "694509",
-        "HCX694509",
-    }
-    candidates = {x for x in candidates if x}
-    if compact in candidates:
-        return True
-    # 允許會員回覆「密碼 694509」「專屬密碼694509」
-    return any(pw in compact for pw in ["694509", "HCX694509"])
-
 def handle_premium_password(user_id, raw_text):
-    if not _premium_password_ok(raw_text):
+    password_command = _strategy_by_password(raw_text)
+    if not password_command:
         return "", ""
-    users = load_triangle_users()
-    users.add(str(user_id))
-    save_triangle_users(users)
-    pending = pop_pending_premium_command(user_id)
-    if pending:
-        return f"✅ 專屬密碼正確，已開通付費功能\n即將執行：{pending}", pending
-    return "✅ 專屬密碼正確，已開通付費功能\n可使用：三角收斂、布林戰法", ""
+
+    pending = peek_pending_premium_command(user_id)
+
+    # 有等待中的策略時，密碼必須對應該策略，避免買A策略卻開B策略。
+    if pending and pending != password_command:
+        return (
+            f"❌ 專屬密碼不符合「{pending}」\n"
+            f"請輸入「{pending}」的專屬密碼，或重新點選要查詢的策略。",
+            ""
+        )
+
+    command = pending or password_command
+    pop_pending_premium_command(user_id)
+    grant_premium_session(user_id, command)
+
+    mins = max(1, int(PREMIUM_SESSION_TTL / 60))
+    return (
+        f"✅ {command} 專屬密碼正確\n"
+        f"本次開通有效 {mins} 分鐘，逾時需重新輸入專屬密碼。\n"
+        f"即將執行：{command}",
+        command
+    )
 
 def handle_triangle_password(user_id, raw_text):
     msg, _cmd = handle_premium_password(user_id, raw_text)
     return msg
 
 def premium_password_message(command="付費功能"):
-    return f"🔒 {command} 為付費功能\n請直接回覆專屬密碼後再使用。"
+    set_text = ""
+    if command == "三角收斂":
+        set_text = "請輸入三角收斂專屬密碼。"
+    elif command == "布林戰法":
+        set_text = "請輸入布林戰法專屬密碼。"
+    else:
+        set_text = "請輸入該策略專屬密碼。"
+    return f"🔒 {command} 為付費功能\n{set_text}\n驗證後 15 分鐘內可重複查詢，逾時需重新驗證。"
 
 def triangle_password_message():
     return premium_password_message("三角收斂")
@@ -1705,8 +1895,8 @@ def help_message():
 🟢 當沖空
 🟠 隔日沖
 🟦 波段股
-🔺 三角收斂（付費）
-📈 布林戰法（付費）
+🔺 三角收斂（付費｜15分鐘驗證）
+📈 布林戰法（付費｜15分鐘驗證）
 
 觸控選單：
 🔳 主選單
@@ -1914,7 +2104,7 @@ def handle_message(event):
         if reminder_cmd:
             reply_text(event.reply_token, handle_reminder(user_id, reminder_cmd)); return
         if quantum_cmd:
-            if quantum_cmd in PREMIUM_COMMANDS and not is_premium_authorized(user_id):
+            if quantum_cmd in PREMIUM_COMMANDS and not is_premium_authorized(user_id, quantum_cmd):
                 set_pending_premium_command(user_id, quantum_cmd)
                 reply_text(event.reply_token, premium_password_message(quantum_cmd))
                 return
